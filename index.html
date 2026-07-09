@@ -261,7 +261,8 @@
 <body>
 <div class="wrap">
   <h1>Forge PvP Sim</h1>
-  <p class="sub">Monte-Carlo simulator for Forge Master arena fights — enter base values + % bonuses from the hero sheet, pick 3 skills, then Run.</p>
+  <p class="sub">Monte-Carlo simulator for Forge Master arena fights — enter base values + % bonuses from the hero sheet, pick 3 skills, then Run.
+  <span id="buildTag" style="opacity:.65"></span></p>
 
   <div class="heroes">
     <div class="card panel" id="panel-me"></div>
@@ -321,6 +322,10 @@
 
 <script>
 'use strict';
+
+// Shown in the header so a stale cached copy is identifiable at a glance.
+// Bump together with CACHE_VERSION in sw.js on every deploy.
+const APP_BUILD = 'v6 — per-player skill & Inspired figures';
 
 /* =====================================================================
    TUNABLE CONSTANTS — each is an assumption to correct against the game.
@@ -1734,6 +1739,7 @@ buildPanel('opp', 'Opponent');
 setType('opp', 'ranged');     // arbitrary default so the two panels differ
 refreshPresetLists();
 restoreState();
+$('buildTag').textContent = '· build ' + APP_BUILD;
 </script>
 </body>
 </html>
