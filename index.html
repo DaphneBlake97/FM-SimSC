@@ -188,6 +188,31 @@
   .tile .tl { font-size: 11.5px; color: var(--muted); }
   .tile .tv { font-size: 19px; font-weight: 600; }
 
+  /* ---------- sanity warnings + debug trace ---------- */
+  #warnBox {
+    border: 1px solid var(--bad);
+    background: rgba(208, 59, 59, .08);
+    color: var(--bad);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 13px;
+    font-weight: 600;
+    margin: 0 0 14px;
+  }
+  #warnBox div { margin: 2px 0; }
+  .trace-card { margin-top: 14px; }
+  #traceOut {
+    font: 12px/1.55 Consolas, Menlo, monospace;
+    white-space: pre;
+    overflow: auto;
+    max-height: 440px;
+    background: var(--page);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px;
+    margin: 0;
+  }
+
   /* ---------- histogram ---------- */
   .hist-card { margin-top: 14px; }
   .hist-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
@@ -257,6 +282,14 @@
       <input type="number" inputmode="numeric" id="simCount" min="1" max="10000" step="1" value="100">
     </div>
     <button id="runBtn">Run</button>
+    <button id="traceBtn" class="small">🐞 Debug: trace one fight</button>
+  </div>
+
+  <div id="warnBox" hidden></div>
+
+  <div class="card trace-card" id="traceCard" hidden>
+    <h2>Debug trace — one fight</h2>
+    <pre id="traceOut"></pre>
   </div>
 
   <div class="card" id="results" hidden>
@@ -303,10 +336,16 @@ const BLOCK_REDUCTION = 0.5;        // a blocked hit does (1 - this) of its dama
                                     // Block is the ONLY mitigation (no defense/armour stat).
 const MELEE_APPROACH_DELAY = 3;     // seconds a melee hero waits before it can attack/cast; ranged = 0.
                                     // While approaching it still regens and can be damaged freely.
+const BASE_ATTACK_SPEED = 1;        // the game's base attack rate is always 1 attack/s — only the
+                                    // Attack Speed % bonus varies, so there is no base-speed input.
 const BASE_INPUT_SCALE = 1000000;   // Base Damage and Base HP are ENTERED IN MILLIONS (2.5 -> 2,500,000).
                                     // SKILLS catalogue numbers are already absolute and are NOT scaled.
 const SKILLS_CAN_CRIT = false;      // basic attacks crit; skills don't, unless true
-const SKILLS_READY_AT_START = true; // skills start off cooldown at t=0 (first cast on the first tick)
+const SKILLS_READY_AT_START = false;// skills START ON COOLDOWN — first cast lands one full cooldown in.
+                                    // Was true: that alpha-strikes the whole loadout on the first tick
+                                    // (~20.5M for a T5 loadout, ≈ a real hero's whole HP pool before
+                                    // anyone swings), which no ~50/50 real fight can survive. Flip to
+                                    // true to compare against the old behaviour.
 const MULTI_HIT_SIMULTANEOUS = true;// multi-hit skills land all hits at once on cast
                                     // (false is not implemented — hits would need a spread-out schedule;
                                     //  tell me the real in-game spacing and I'll add it)
@@ -401,24 +440,77 @@ function skillCooldown(h, def) {
    COMBAT MODEL
    ===================================================================== */
 
+/* ---- debug trace + derived-stat helpers ----
+   TRACE is null in normal runs (zero overhead); resolveFight sets it when
+   given a trace array. All values logged come from the SAME helpers the
+   fight uses, so a units bug in the math shows up verbatim in the trace. */
+let TRACE = null;   // { arr, t, A } while a traced fight runs
+const tfmt = n => {
+  const a = Math.abs(n);
+  if (a >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (a >= 1e3) return (n / 1e3).toFixed(0) + 'K';
+  return String(Math.round(n));
+};
+function tlog(msg) {
+  if (!TRACE) return;
+  if (TRACE.arr.length >= 1500) {
+    if (TRACE.arr.length === 1500) TRACE.arr.push('… log truncated …');
+    return;
+  }
+  TRACE.arr.push('t=' + TRACE.t.toFixed(2).padStart(6) + '  ' + msg);
+}
+const tside = f => (TRACE && f === TRACE.A) ? 'ME ' : 'OPP';
+
+// Derived numbers for one hero, exactly as the fight computes them.
+function derivedStats(h) {
+  const f = { s: h, buffs: [] };
+  const aps = effAtkSpeed(f);
+  const engage = h.isMelee ? MELEE_APPROACH_DELAY : 0;
+  return {
+    effDamage: effDamage(f),
+    effMaxHp: effMaxHp(f),
+    atkPerSec: aps,
+    interval: aps > 0 ? 1 / aps : Infinity,
+    engage,
+    firstAttackAt: aps > 0 ? engage + 1 / aps : Infinity,
+    skills: (h.skills || []).map(def => {
+      const cd = skillCooldown(h, def);
+      return {
+        name: def.name, cd,
+        firstCastAt: engage + (SKILLS_READY_AT_START ? 0 : cd),
+        dmgTotal: def.type === 'damage_enemy'
+          ? def.hits * def.dmgPerHit * (APPLY_SKILL_DMG_STAT ? 1 + h.skillDmgPct / 100 : 1)
+          : 0,
+        healTotal: (def.type === 'buff_self' && def.maxHpAdd)
+          ? def.maxHpAdd * (APPLY_SKILL_HP_STAT ? 1 + h.skillHpPct / 100 : 1)
+          : 0,
+      };
+    }),
+  };
+}
+
 // updateBuffs(f, dt): tick buff durations; when one expires, remove its
 // effect, re-clamp HP to the (now lower) effMaxHP, and — for skills with
 // cooldownFrom 'activeEnd' — start that skill's cooldown from zero.
 function updateBuffs(f, dt) {
   if (!f.buffs.length) return;
-  let expired = false;
+  const expired = [];
   const keep = [];
   for (const b of f.buffs) {
     b.remaining -= dt;
     if (b.remaining > 0) { keep.push(b); continue; }
-    expired = true;
+    expired.push(b.src && b.src.def ? b.src.def.name : '?');
     if (b.src && b.src.def.cooldownFrom === 'activeEnd') {
       b.src.state = 'cooldown';
       b.src.timer = 0;
     }
   }
   f.buffs = keep;
-  if (expired) f.hp = Math.min(f.hp, effMaxHp(f));  // buff HP is lost when the buff ends
+  if (expired.length) {
+    f.hp = Math.min(f.hp, effMaxHp(f));  // buff HP is lost when the buff ends
+    if (TRACE) tlog(tside(f) + ' buff expired: ' + expired.join(', ') +
+      ' → maxHP ' + tfmt(effMaxHp(f)) + ', hp re-clamped to ' + tfmt(f.hp));
+  }
 }
 
 // dealAttack(atk, def): one basic attack. Rolls double strike once, then
@@ -427,24 +519,35 @@ function updateBuffs(f, dt) {
 // Tallies land on the fighter that owns them: attacker's crits/doubleStrikes/
 // dmgDealt, DEFENDER's blocks (blocks = "hits this fighter blocked").
 function dealAttack(atk, def) {
+  atk.tally.attacks++;
   const dmg = effDamage(atk);
   const doubled = Math.random() < atk.s.doubleStrike / 100;
   if (doubled) atk.tally.doubleStrikes++;
   const hits = doubled ? 2 : 1;
   for (let i = 0; i < hits; i++) {
     let d = dmg;
+    let crit = false, block = false;
     if (Math.random() < atk.s.critChance / 100) {
       d *= 1 + atk.s.critDmg / 100;          // Crit Dmg is a +% bonus (50 = ×1.5 on crits)
-      atk.tally.crits++;
+      atk.tally.crits++; crit = true;
     }
     if (Math.random() < def.s.blockChance / 100) {
       d *= 1 - BLOCK_REDUCTION;
-      def.tally.blocks++;
+      def.tally.blocks++; block = true;
     }
+    const hpB = def.hp;
     def.hp -= d;
-    if (atk.s.lifesteal > 0)
+    let lsGain = 0;
+    if (atk.s.lifesteal > 0) {
+      const aB = atk.hp;
       atk.hp = Math.min(effMaxHp(atk), atk.hp + d * atk.s.lifesteal / 100);
+      lsGain = atk.hp - aB;
+    }
     atk.tally.dmgDealt += d;
+    if (TRACE) tlog(tside(atk) + ' basic' + (hits > 1 ? ' (double ' + (i + 1) + '/2)' : '') +
+      ' → ' + tfmt(d) + (crit ? ' CRIT' : '') + (block ? ' BLOCKED' : '') +
+      (lsGain > 0 ? ' (lifesteal +' + tfmt(lsGain) + ')' : '') +
+      ' | ' + tside(def) + ' hp ' + tfmt(hpB) + ' → ' + tfmt(Math.max(0, def.hp)));
     if (def.hp <= 0) return true;
   }
   return false;
@@ -472,8 +575,11 @@ function castSkill(caster, target, sk) {
         d *= 1 + caster.s.critDmg / 100;     // same +% bonus convention as basic attacks
         caster.tally.crits++;
       }
+      const hpB = target.hp;
       target.hp -= d;                 // not blockable, no lifesteal (assumptions)
       caster.tally.dmgDealt += d;
+      if (TRACE) tlog(tside(caster) + ' skill ' + def.name + ' hit ' + (i + 1) + '/' + def.hits +
+        ' → ' + tfmt(d) + ' | ' + tside(target) + ' hp ' + tfmt(hpB) + ' → ' + tfmt(Math.max(0, target.hp)));
       if (target.hp <= 0) return true;
     }
   } else if (def.type === 'buff_self') {
@@ -484,10 +590,16 @@ function castSkill(caster, target, sk) {
       maxHpAdd: def.maxHpAdd || 0,
       remaining: def.durationSec,
     });
+    const hpB = caster.hp;
     if (def.maxHpAdd) {
       const healAmt = def.maxHpAdd * (APPLY_SKILL_HP_STAT ? 1 + caster.s.skillHpPct / 100 : 1);
       caster.hp = Math.min(effMaxHp(caster), caster.hp + healAmt);
     }
+    if (TRACE) tlog(tside(caster) + ' skill ' + def.name + ' buff applied (' +
+      (def.baseDamageAdd ? '+' + tfmt(def.baseDamageAdd) + ' base dmg, ' : '') +
+      (def.maxHpAdd ? '+' + tfmt(def.maxHpAdd) + ' maxHP, ' : '') + def.durationSec + 's)' +
+      (caster.hp > hpB ? '; heal ' + tfmt(hpB) + ' → ' + tfmt(caster.hp) : '') +
+      ' | maxHP now ' + tfmt(effMaxHp(caster)));
     if (def.cooldownFrom === 'activeEnd') sk.state = 'active';
   }
   return target.hp <= 0;
@@ -500,14 +612,14 @@ function castSkill(caster, target, sk) {
 // { win, durationSeconds, myHpLeft, oppHpLeft,   // HP left as % of effMaxHP at fight end
 //   dmgDealt, dmgTaken, crits, blocks, doubleStrikes, skillCasts,  // my counts
 //   hitTimeCap }                                  // true if the fight reached TIME_CAP
-function resolveFight(me, opp) {
+function resolveFight(me, opp, traceArr) {
   // Build a live fighter: full HP, attack timer, one timer per equipped skill.
   // engage: melee heroes must close the distance first — their attack AND skill
   // timers are frozen until t >= engage (they still regen and can be hit).
   function mkFighter(h) {
-    const f = { s: h, buffs: [], atkT: 0,
+    const f = { s: h, buffs: [], atkT: 0, regenAcc: 0,
       engage: h.isMelee ? MELEE_APPROACH_DELAY : 0,
-      tally: { dmgDealt: 0, crits: 0, blocks: 0, doubleStrikes: 0, skillCasts: 0 } };
+      tally: { dmgDealt: 0, attacks: 0, crits: 0, blocks: 0, doubleStrikes: 0, skillCasts: 0 } };
     f.skills = (h.skills || []).map(def => {
       const cd = skillCooldown(h, def);
       // state 'cooldown': timer accumulates toward cd. state 'active': a buff
@@ -519,19 +631,32 @@ function resolveFight(me, opp) {
     return f;
   }
   const A = mkFighter(me), B = mkFighter(opp);   // A = me
+  TRACE = traceArr ? { arr: traceArr, t: 0, A } : null;
 
   let t = 0;
   let winner = null; // 'me' | 'opp'
+  let hitTimeCap = false;
+  try {
   outer:
   while (t < TIME_CAP - 1e-9) {
     t += DT;
+    if (TRACE) TRACE.t = t;
 
     for (const f of [A, B]) {
       // 1. Regen: % of CURRENT effMaxHP per second, continuous, capped.
-      if (f.s.regen > 0)
+      if (f.s.regen > 0) {
+        const hpB = f.hp;
         f.hp = Math.min(effMaxHp(f), f.hp + effMaxHp(f) * (f.s.regen / 100) * DT);
+        if (TRACE) f.regenAcc += f.hp - hpB;
+      }
       // 2. Buffs tick / expire (may re-clamp HP and release 'activeEnd' cooldowns).
       updateBuffs(f, DT);
+    }
+    // regen summary once per simulated second (only when tracing)
+    if (TRACE && Math.floor(t + 1e-9) > Math.floor(t - DT + 1e-9) && (A.regenAcc > 0 || B.regenAcc > 0)) {
+      tlog('regen (last 1s): ME +' + tfmt(A.regenAcc) + ' (hp ' + tfmt(A.hp) + '), OPP +' +
+        tfmt(B.regenAcc) + ' (hp ' + tfmt(B.hp) + ')');
+      A.regenAcc = 0; B.regenAcc = 0;
     }
 
     // Within-tick action order (see RANDOM_ACTION_ORDER).
@@ -571,9 +696,15 @@ function resolveFight(me, opp) {
 
   // Time cap: higher HP% (of current effMaxHP) wins; a dead-even tie counts
   // as a loss (conservative).
-  const hitTimeCap = (winner === null);
+  hitTimeCap = (winner === null);
   if (hitTimeCap)
     winner = (A.hp / effMaxHp(A)) > (B.hp / effMaxHp(B)) ? 'me' : 'opp';
+
+  if (TRACE) {
+    if (hitTimeCap) tlog('★ TIME CAP — winner by HP%: ' + (winner === 'me' ? 'ME' : 'OPP'));
+    else tlog('★ ' + (winner === 'me' ? 'OPP dies' : 'ME dies') + ' — killed by the event above');
+  }
+  } finally { TRACE = null; }
 
   return {
     win: winner === 'me',
@@ -586,6 +717,8 @@ function resolveFight(me, opp) {
     blocks: A.tally.blocks,            // hits I blocked
     doubleStrikes: A.tally.doubleStrikes,
     skillCasts: A.tally.skillCasts,
+    myAttacks: A.tally.attacks,        // basic-attack events (for sanity checks)
+    oppAttacks: B.tally.attacks,
     hitTimeCap,
   };
 }
@@ -595,9 +728,8 @@ function resolveFight(me, opp) {
 /* ---------- stat schema (drives panel construction + presets) ---------- */
 // Field order matches the in-game stat screen so values can be entered top-to-bottom.
 const STAT_DEFS = [
-  { key: 'baseDamage',   label: 'Base Damage (in millions)',    def: 0.5, min: 0,  group: 'Base values' },
-  { key: 'baseHp',       label: 'Base HP (in millions)',        def: 10,  min: 0.000001 },
-  { key: 'baseAtkSpeed', label: 'Base Attack Speed (/s)',       def: 1.0, min: 0, step: 0.01 },
+  { key: 'baseDamage',   label: 'Base Damage (in millions)',    def: 3,   min: 0,  group: 'Base values' },
+  { key: 'baseHp',       label: 'Base HP = Combat Power (in millions)', def: 150, min: 0.000001 },
   { key: 'critChance',   label: 'Crit Chance %',                def: 0,   min: 0,  group: 'Percentage bonuses' },
   { key: 'critDmg',      label: 'Crit Dmg % — +% bonus (50 = 1.5× on crits)', def: 50, min: 0 },
   { key: 'blockChance',  label: 'Block Chance %',               def: 0,   min: 0 },
@@ -772,6 +904,7 @@ function readHero(side) {
     if (!isFinite(v)) v = s.def;
     h[s.key] = Math.max(s.min, v);
   }
+  h.baseAtkSpeed = BASE_ATTACK_SPEED;   // fixed by the game; only the % bonus varies
   h.skillIds = [0, 1, 2].map(i => $(side + '-skill' + i).value).filter(Boolean);
   h.skills = h.skillIds.map(id => SKILLS[id]).filter(Boolean);
   return h;
@@ -851,6 +984,41 @@ function restoreState() {
   } catch (e) {}
 }
 
+/* ---------- sanity checks (run on every sim + trace, shown loudly) ---------- */
+function sanityWarnings(me, opp, agg) {
+  const w = [];
+  const dM = derivedStats(me), dO = derivedStats(opp);
+  for (const [who, h, D, foeName, F] of [
+    ['My hero', me, dM, "the opponent", dO],
+    ['The opponent', opp, dO, "my hero", dM],
+  ]) {
+    if (D.effDamage >= 0.5 * F.effMaxHp)
+      w.push(who + "'s single basic hit (" + fmtC(D.effDamage) + ') is ≥ 50% of ' + foeName +
+        "'s Max HP (" + fmtC(F.effMaxHp) + ') — likely units mismatch.');
+    const critHit = D.effDamage * (1 + h.critDmg / 100);
+    if (h.critChance > 0 && critHit >= F.effMaxHp)
+      w.push(who + "'s CRIT hit (" + fmtC(critHit) + ', ' + h.critChance + '% chance) one-shots ' +
+        foeName + ' (' + fmtC(F.effMaxHp) + ' HP).');
+    if (D.atkPerSec > 5)
+      w.push(who + "'s attack speed is " + D.atkPerSec.toFixed(2) + '/s (> 5) — attack speed may be in wrong units.');
+    if (SKILLS_READY_AT_START) {
+      const alpha = D.skills.reduce((s, k) => s + k.dmgTotal, 0);
+      if (alpha > F.effMaxHp)
+        w.push(who + "'s skill damage available at t=0 (" + fmtC(alpha) + ') exceeds ' + foeName +
+          "'s Max HP (" + fmtC(F.effMaxHp) + ') — the whole loadout alpha-strikes on the first tick.');
+    }
+  }
+  if (agg && agg.n > 0 && agg.loserNeverActed / agg.n >= 0.25)
+    w.push('In ' + Math.round(agg.loserNeverActed / agg.n * 100) + '% of fights the loser died before landing a single basic attack' +
+      ' — damage and HP are mismatched, or the engage delay decides everything.');
+  return w;
+}
+function renderWarnings(w) {
+  const box = $('warnBox');
+  box.hidden = w.length === 0;
+  box.innerHTML = w.map(x => '<div>⚠ ' + x.replace(/</g, '&lt;') + '</div>').join('');
+}
+
 /* ---------- run N simulations and aggregate ---------- */
 // Deterministic handling: if neither hero has crit/block/double-strike chance,
 // each run can only differ through the random within-tick action order (which
@@ -878,7 +1046,7 @@ function runSims(n) {
     for (let i = probeN; i < n; i++) results.push(resolveFight(me, opp));
 
   const g = { n: deterministic ? 1 : results.length, deterministic,
-              wins: 0, losses: 0, timeouts: 0,
+              wins: 0, losses: 0, timeouts: 0, loserNeverActed: 0,
               sumDur: 0, sumHpWin: 0, sumOppHpLoss: 0,
               sumDealt: 0, sumTaken: 0, sumCrits: 0, sumBlocks: 0, sumDS: 0, sumCasts: 0,
               hp: [], dur: [] };
@@ -886,6 +1054,7 @@ function runSims(n) {
   for (const r of use) {
     if (r.win) { g.wins++; g.sumHpWin += r.myHpLeft; }
     else       { g.losses++; g.sumOppHpLoss += r.oppHpLeft; }
+    if (!r.hitTimeCap && (r.win ? r.oppAttacks : r.myAttacks) === 0) g.loserNeverActed++;
     if (r.hitTimeCap) g.timeouts++;
     g.sumDur   += r.durationSeconds;
     g.sumDealt += r.dmgDealt;      g.sumTaken += r.dmgTaken;
@@ -894,6 +1063,7 @@ function runSims(n) {
     g.hp.push(r.myHpLeft);
     g.dur.push(r.durationSeconds);
   }
+  g.warnings = sanityWarnings(me, opp, g);
   return g;
 }
 
@@ -903,6 +1073,7 @@ let metric = 'hp';    // 'hp' | 'dur'
 
 function renderResults(g) {
   lastRun = g;
+  renderWarnings(g.warnings || []);
   $('results').hidden = false;
   const wp = $('winPct'), v = $('verdict');
 
@@ -1186,8 +1357,10 @@ function preprocessForOcr(src) {
     const r = d[j], g = d[j + 1], b = d[j + 2];
     const lum = (r * 299 + g * 587 + b * 114) / 1000;
     const sat = Math.max(r, g, b) - Math.min(r, g, b);
-    const isText = lum >= OCR_TEXT_MIN_LUM && sat <= OCR_TEXT_MAX_SAT;
-    const v = isText ? 0 : 255;
+    const isWhite = lum >= OCR_TEXT_MIN_LUM && sat <= OCR_TEXT_MAX_SAT;
+    // the Combat Power number is GOLD (#f2b53a-ish) — keep it too
+    const isGold = r >= 190 && g >= 140 && b <= 130 && lum >= 150;
+    const v = (isWhite || isGold) ? 0 : 255;
     d[j] = d[j + 1] = d[j + 2] = v; d[j + 3] = 255;
   }
   ctx2.putImageData(img, 0, 0);
@@ -1223,7 +1396,10 @@ function fileToCanvas(file, maxSide) {
 // bonus, a large raw number is a base value (converted to millions).
 const OCR_MATCHERS = [
   { keys: ['total damage', 'total dmg'],                      field: null,           kind: 'dmg' },
-  { keys: ['total health', 'total hp'],                       field: null,           kind: 'hp' },
+  // "Total Health" is a CONTRIBUTOR stat, not combat HP — match it so its number
+  // is consumed, but fill nothing. Combat HP comes from the unlabeled Combat
+  // Power number (the ⚔ value, e.g. "151m") — see the power rule in extractStats.
+  { keys: ['total health', 'total hp'],                       field: null,           kind: 'skip' },
   { keys: ['skill damage', 'skill dmg'],                      field: 'skillDmgPct',  kind: 'pct' },
   { keys: ['skill cooldown', 'skill cd', 'cooldown'],         field: 'skillCdPct',   kind: 'pct' },
   { keys: ['skill hp', 'skill health'],                       field: 'skillHpPct',   kind: 'pct' },
@@ -1241,7 +1417,7 @@ const OCR_MATCHERS = [
   { keys: ['damage', 'dmg', 'atk'],                           field: null,           kind: 'dmg' },   // "+7.08% Damage"
 ];
 const OCR_FIELD_LABELS = {
-  baseDamage: 'Base Damage', baseHp: 'Base HP', baseAtkSpeed: 'Attack Speed (base)',
+  baseDamage: 'Base Damage', baseHp: 'Base HP (Combat Power)',
   critChance: 'Crit Chance', critDmg: 'Crit Dmg', blockChance: 'Block',
   regen: 'Health Regen', lifesteal: 'Lifesteal', doubleStrike: 'Double Strike',
   damagePct: 'Damage %', meleePct: 'Melee Dmg %', rangedPct: 'Ranged Dmg %',
@@ -1289,10 +1465,10 @@ function matchOcrField(label, num) {
       if (num.hadSuffix) return null;               // "12K" is not a % bonus — misread
       return { field: M.field, value: num.value };
     }
-    if (M.kind === 'speed') {                       // "only if a raw base is shown"
-      if (num.isPct) return { field: 'atkSpeedPct', value: num.value };
-      return (num.value > 0 && num.value <= 20 && !num.hadSuffix)
-        ? { field: 'baseAtkSpeed', value: num.value } : null;
+    if (M.kind === 'skip') return { field: null };  // consumed, fills nothing
+    if (M.kind === 'speed') {
+      // base attack speed is fixed at 1/s — only a % bonus is usable
+      return num.isPct ? { field: 'atkSpeedPct', value: num.value } : { field: null };
     }
     if (M.kind === 'hp') {
       if (num.isPct) return { field: 'maxHpPct', value: num.value };
@@ -1315,6 +1491,7 @@ function matchOcrField(label, num) {
 // pairs with a number-only next line. First value found for a field wins.
 function extractStats(lineTexts) {
   const fills = {};
+  const powerCands = [];     // unlabeled suffixed numbers — Combat Power candidates
   let pendingLabel = null;   // label-only line waiting for a number-only line
   for (const raw of lineTexts) {
     let line = (raw || '').trim();
@@ -1341,10 +1518,20 @@ function extractStats(lineTexts) {
       // number-only line right after a label-only line ("Ranged Dmg" / "+45%")
       if (!hit && !before && !after && toks.length === 1 && pendingLabel)
         hit = matchOcrField(pendingLabel, num);
-      if (hit && fills[hit.field] === undefined) fills[hit.field] = hit.value;
+      if (hit) {
+        if (hit.field && fills[hit.field] === undefined) fills[hit.field] = hit.value;
+      } else if (!num.isPct && num.hadSuffix && num.value >= 1e6) {
+        // Combat Power: the ⚔ number has NO text label (e.g. "151m", possibly
+        // merged into the name line). It IS the combat HP pool.
+        powerCands.push(num.value);
+      }
     }
     pendingLabel = null;
   }
+  // The power number is the biggest unlabeled suffixed value on the sheet
+  // (protects against a mangled "Total Damage" label leaking its 3.47m here).
+  if (fills.baseHp === undefined && powerCands.length)
+    fills.baseHp = round6(Math.max(...powerCands) / 1e6);
   return fills;
 }
 
@@ -1400,8 +1587,10 @@ async function runAutofill(side, file) {
         : String(data.text || '').split('\n');
     };
     let fills = extractStats(await readLines(preprocessForOcr(canvas)));
-    if (Object.keys(fills).length === 0)
-      fills = extractStats(await readLines(canvas));
+    // Second pass on the untouched image when nothing was read OR a key base
+    // value is still missing; merge with binarized-pass values winning.
+    if (Object.keys(fills).length === 0 || fills.baseHp === undefined || fills.baseDamage === undefined)
+      fills = Object.assign({}, extractStats(await readLines(canvas)), fills);
     const { filled, missing } = applyOcrFills(side, fills);
     status.textContent = filled
       ? `Autofilled ${filled} field${filled > 1 ? 's' : ''} — review before running.` +
@@ -1418,6 +1607,47 @@ async function runAutofill(side, file) {
 if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
+
+/* ---------- debug: trace one fight ---------- */
+$('traceBtn').addEventListener('click', () => {
+  const me = readHero('me'), opp = readHero('opp');
+  const dM = derivedStats(me), dO = derivedStats(opp);
+  const L = [];
+  const block = (tag, h, D, F) => {
+    L.push('── ' + tag + ' ──');
+    L.push('  effDamage per basic hit: ' + fmtC(D.effDamage) +
+      '   (on crit: ' + fmtC(D.effDamage * (1 + h.critDmg / 100)) + ')');
+    L.push('  effMaxHP: ' + fmtC(D.effMaxHp));
+    L.push('  attacks/sec: ' + D.atkPerSec.toFixed(2) +
+      '  (one every ' + (isFinite(D.interval) ? D.interval.toFixed(3) + 's' : '—') + ')' +
+      '   engage t=' + D.engage + 's → first basic ≈ t=' +
+      (isFinite(D.firstAttackAt) ? D.firstAttackAt.toFixed(2) : '—'));
+    for (const k of D.skills)
+      L.push('  skill ' + k.name + ': ' +
+        (k.dmgTotal ? fmtC(k.dmgTotal) + ' dmg per cast' : 'buff' + (k.healTotal ? ' + heal ' + fmtC(k.healTotal) : '')) +
+        ', cd ' + k.cd.toFixed(2) + 's, first cast ≈ t=' + k.firstCastAt.toFixed(2));
+    const hits = Math.ceil(F.effMaxHp / D.effDamage);
+    L.push('  hits to kill (basic only, no crit/block): ' + hits +
+      '  → naive TTK ≈ ' + (isFinite(D.interval) ? (D.engage + hits * D.interval).toFixed(2) + 's' : '—') +
+      '  (ignores regen/skills)');
+  };
+  block('ME — My Hero', me, dM, dO);
+  block('OPP — Opponent', opp, dO, dM);
+  const w = sanityWarnings(me, opp, null);
+  renderWarnings(w);
+  if (w.length) { L.push(''); for (const x of w) L.push('⚠ ' + x); }
+  L.push('', '── events ──');
+  const events = [];
+  const r = resolveFight(me, opp, events);
+  L.push(...events);
+  L.push('', 'RESULT: ' + (r.win ? 'WIN — opponent died' : 'LOSS — my hero died') +
+    (r.hitTimeCap ? ' (time cap, decided by HP%)' : '') +
+    ' at t=' + r.durationSeconds.toFixed(2) + 's' +
+    '  |  my HP left ' + r.myHpLeft.toFixed(1) + '%  |  opp HP left ' + r.oppHpLeft.toFixed(1) + '%' +
+    '  |  my basic attacks: ' + r.myAttacks + ', opponent: ' + r.oppAttacks);
+  $('traceOut').textContent = L.join('\n');
+  $('traceCard').hidden = false;
+});
 
 /* ---------- init ---------- */
 loadOverrides();
