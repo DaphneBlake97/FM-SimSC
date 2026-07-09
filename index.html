@@ -270,9 +270,10 @@
 
   <div class="card skills-card">
     <h2>Skill catalogue</h2>
-    <p class="note">Cooldowns and per-hit damage are editable — tune them here as you confirm them in-game
-    (saved on this device). Hit counts are fixed. Damage is entered in millions and is a BASE value; the
-    <code>APPLY_SKILL_*</code> constants in the file control whether the global Skill Dmg/Hp/Cooldown % stats scale it.</p>
+    <p class="note">Cooldowns are editable here (approximate — tune as you time them in-game; saved on this
+    device) and hit counts are fixed — both apply to BOTH players. <b>Damage is per player</b>: set each
+    hero's own dmg/hit next to the equipped slot in its panel (entered in millions; saved with presets).
+    The <code>APPLY_SKILL_*</code> constants in the file control whether the global Skill Dmg/Hp/Cooldown % stats scale skills.</p>
     <div id="skillRows"></div>
   </div>
 
@@ -398,6 +399,11 @@ const SKILLS = {
 
   // Remaining skills (Tiers 1–3, Tier 6) go here in the same shape.
 };
+// Self-id each def: per-hero damage overrides look skills up by id.
+for (const [id, s] of Object.entries(SKILLS)) s.id = id;
+// NOTE: cooldown and hit count are FIXED per skill (catalogue-level), but
+// DAMAGE per hit is independent per player — each hero carries a
+// skillDmgs { skillId: absoluteDmgPerHit } map that overrides dmgPerHit.
 
 /* =====================================================================
    DERIVED EFFECTIVE STATS — computed live because buffs can change base
@@ -475,11 +481,13 @@ function derivedStats(h) {
     firstAttackAt: aps > 0 ? engage + 1 / aps : Infinity,
     skills: (h.skills || []).map(def => {
       const cd = skillCooldown(h, def);
+      // per-hero damage override, falling back to the catalogue default
+      const perHit = (h.skillDmgs && h.skillDmgs[def.id] != null) ? h.skillDmgs[def.id] : (def.dmgPerHit || 0);
       return {
         name: def.name, cd,
         firstCastAt: engage + (SKILLS_READY_AT_START ? 0 : cd),
         dmgTotal: def.type === 'damage_enemy'
-          ? def.hits * def.dmgPerHit * (APPLY_SKILL_DMG_STAT ? 1 + h.skillDmgPct / 100 : 1)
+          ? def.hits * perHit * (APPLY_SKILL_DMG_STAT ? 1 + h.skillDmgPct / 100 : 1)
           : 0,
         healTotal: (def.type === 'buff_self' && def.maxHpAdd)
           ? def.maxHpAdd * (APPLY_SKILL_HP_STAT ? 1 + h.skillHpPct / 100 : 1)
@@ -568,7 +576,8 @@ function castSkill(caster, target, sk) {
   caster.tally.skillCasts++;
   const def = sk.def;
   if (def.type === 'damage_enemy') {
-    const per = def.dmgPerHit * (APPLY_SKILL_DMG_STAT ? 1 + caster.s.skillDmgPct / 100 : 1);
+    // sk.dmg is the CASTER's damage for this skill (per-player; see mkFighter)
+    const per = sk.dmg * (APPLY_SKILL_DMG_STAT ? 1 + caster.s.skillDmgPct / 100 : 1);
     for (let i = 0; i < def.hits; i++) {
       let d = per;
       if (SKILLS_CAN_CRIT && Math.random() < caster.s.critChance / 100) {
@@ -625,7 +634,11 @@ function resolveFight(me, opp, traceArr) {
       // state 'cooldown': timer accumulates toward cd. state 'active': a buff
       // with cooldownFrom 'activeEnd' is running — timer paused until it ends.
       // Timer starts full when SKILLS_READY_AT_START, so the skill fires on tick 1.
-      return { def, cd, state: 'cooldown', timer: SKILLS_READY_AT_START ? cd : 0 };
+      // dmg: this HERO's damage for the skill (falls back to the catalogue value).
+      return {
+        def, cd, state: 'cooldown', timer: SKILLS_READY_AT_START ? cd : 0,
+        dmg: (h.skillDmgs && h.skillDmgs[def.id] != null) ? h.skillDmgs[def.id] : (def.dmgPerHit || 0),
+      };
     });
     f.hp = effMaxHp(f);
     return f;
@@ -751,7 +764,6 @@ const STAT_DEFS = [
 const LS_PRESETS = 'forge-pvp-presets-v4';
 const LS_LAST    = 'forge-pvp-last-v4';
 const LS_CDS     = 'forge-pvp-skill-cds-v3';
-const LS_DMGS    = 'forge-pvp-skill-dmgs-v3';
 const $ = id => document.getElementById(id);
 
 const fmt1 = n => isFinite(n) ? (Math.round(n * 10) / 10).toLocaleString() : '—';
@@ -766,23 +778,23 @@ function fmtC(n) {    // compact number (520000 -> 520K, 8000000 -> 8M)
   return s.replace(/\.0+([KMB])$/, '$1').replace(/(\.\d)0([KMB])$/, '$1$2');
 }
 
-/* ---------- skill catalogue UI (editable cooldowns, persisted) ---------- */
+/* ---------- skill catalogue UI ----------
+   Cooldowns are editable here (approximate — real values unknown) and persist
+   on this device; they are FIXED per skill across both players. Hit counts are
+   fixed too. DAMAGE is per player and lives in the hero panels next to each
+   equipped slot (the number here is only the default for a new slot). */
 function skillSummary(def) {
+  if (def.type === 'damage_enemy')
+    return `${def.hits} hit${def.hits > 1 ? 's' : ''} × ${fmtC(def.dmgPerHit)} default dmg — actual damage set per player in the hero panels`;
   if (def.type === 'buff_self')
     return `+${fmtC(def.baseDamageAdd)} base Dmg, +${fmtC(def.maxHpAdd)} Max HP (heals that on cast), ${def.durationSec}s buff`;
   return def.type;
 }
-// Persisted per-skill overrides: cooldowns (LS_CDS) and per-hit damage (LS_DMGS,
-// stored as the absolute value). Hit counts are fixed in the catalogue.
 function loadOverrides() {
   try {
     const cds = JSON.parse(localStorage.getItem(LS_CDS) || '{}');
     for (const id in cds)
       if (SKILLS[id] && isFinite(cds[id]) && cds[id] > 0) SKILLS[id].cooldownSec = cds[id];
-    const dmgs = JSON.parse(localStorage.getItem(LS_DMGS) || '{}');
-    for (const id in dmgs)
-      if (SKILLS[id] && SKILLS[id].type === 'damage_enemy' && isFinite(dmgs[id]) && dmgs[id] > 0)
-        SKILLS[id].dmgPerHit = dmgs[id];
   } catch (e) {}
 }
 function saveOverride(key, id, v) {
@@ -794,24 +806,17 @@ function saveOverride(key, id, v) {
 }
 function buildSkillRows() {
   const host = $('skillRows');
-  host.innerHTML = Object.entries(SKILLS).map(([id, s]) => {
-    // damage skills: editable per-hit damage (entered in MILLIONS, like Base Damage)
-    const effect = s.type === 'damage_enemy'
-      ? `<span class="sksum">${s.hits} hit${s.hits > 1 ? 's' : ''} ×
-           <input type="number" inputmode="decimal" min="0.01" step="0.01" value="${s.dmgPerHit / 1e6}" data-skill-dmg="${id}"> M per hit</span>`
-      : `<span class="sksum">${skillSummary(s)}${s.cooldownFrom === 'activeEnd' ? ' — cooldown starts when the buff ends' : ''}</span>`;
-    return `<div class="skrow">
+  host.innerHTML = Object.entries(SKILLS).map(([id, s]) =>
+    `<div class="skrow">
        <span class="skname">${s.name}<span class="sktier">Tier ${s.tier}${s.tier === 4 ? ' (Yellow)' : s.tier === 5 ? ' (Red)' : ''}</span></span>
-       ${effect}
+       <span class="sksum">${skillSummary(s)}${s.cooldownFrom === 'activeEnd' ? ' — cooldown starts when the buff ends' : ''}</span>
        <span class="skcd">cd (s) <input type="number" inputmode="decimal" min="0.1" step="0.1" value="${s.cooldownSec}" data-skill="${id}"></span>
-     </div>`;
-  }).join('');
+     </div>`).join('');
   host.addEventListener('input', e => {
+    const id = e.target.dataset.skill;
+    if (!id) return;
     const v = parseFloat(e.target.value);
-    if (!isFinite(v) || v <= 0) return;
-    const dmgId = e.target.dataset.skillDmg, cdId = e.target.dataset.skill;
-    if (dmgId)     { SKILLS[dmgId].dmgPerHit = v * 1e6; saveOverride(LS_DMGS, dmgId, v * 1e6); }
-    else if (cdId) { SKILLS[cdId].cooldownSec = v;      saveOverride(LS_CDS, cdId, v); }
+    if (isFinite(v) && v > 0) { SKILLS[id].cooldownSec = v; saveOverride(LS_CDS, id, v); }
   });
 }
 
@@ -857,14 +862,22 @@ function buildPanel(side, title) {
       <input type="number" inputmode="decimal" id="${side}-${s.key}" value="${s.def}" min="${s.min}" step="${s.step || 'any'}">
     </div>`;
   }
-  html += `<div class="grouphead">Skill loadout (pick 3)</div>`;
+  html += `<div class="grouphead">Skill loadout (pick 3) — damage is THIS hero's own figure</div>`;
   for (let i = 0; i < 3; i++) {
     html += `<div class="field">
       <label for="${side}-skill${i}">Slot ${i + 1}</label>
       <select id="${side}-skill${i}">${skillOptionsHtml()}</select>
+    </div>
+    <div class="field" id="${side}-skilldmgwrap${i}" style="visibility:hidden">
+      <label for="${side}-skilldmg${i}">Slot ${i + 1} dmg/hit (M)</label>
+      <input type="number" inputmode="decimal" id="${side}-skilldmg${i}" min="0" step="any">
     </div>`;
   }
   p.innerHTML = html + '</div>';
+
+  // show/hide + default the per-hero damage input when a slot's skill changes
+  for (let i = 0; i < 3; i++)
+    $(side + '-skill' + i).addEventListener('change', () => syncSkillDmgInput(side, i, false));
 
   $(side + '-type').addEventListener('click', e => {
     const b = e.target.closest('button'); if (!b) return;
@@ -907,15 +920,43 @@ function readHero(side) {
   h.baseAtkSpeed = BASE_ATTACK_SPEED;   // fixed by the game; only the % bonus varies
   h.skillIds = [0, 1, 2].map(i => $(side + '-skill' + i).value).filter(Boolean);
   h.skills = h.skillIds.map(id => SKILLS[id]).filter(Boolean);
+  // per-player skill damage: { skillId: absolute dmg per hit } from the slot inputs
+  h.skillDmgs = {};
+  for (let i = 0; i < 3; i++) {
+    const id = $(side + '-skill' + i).value;
+    const def = id && SKILLS[id];
+    if (def && def.type === 'damage_enemy') {
+      const v = parseFloat($(side + '-skilldmg' + i).value);
+      if (isFinite(v) && v >= 0) h.skillDmgs[id] = v * 1e6;   // entered in millions
+    }
+  }
   return h;
+}
+// keepValue: applyHero restores a saved value; a manual slot change resets to default
+function syncSkillDmgInput(side, i, keepValue) {
+  const id = $(side + '-skill' + i).value;
+  const def = id && SKILLS[id];
+  const wrap = $(side + '-skilldmgwrap' + i), inp = $(side + '-skilldmg' + i);
+  if (def && def.type === 'damage_enemy') {
+    wrap.style.visibility = 'visible';
+    if (!keepValue || inp.value === '') inp.value = def.dmgPerHit / 1e6;
+  } else {
+    wrap.style.visibility = 'hidden';
+    inp.value = '';
+  }
 }
 function applyHero(side, h) {
   setType(side, h.isMelee ? 'melee' : 'ranged');
   for (const s of STAT_DEFS)
     if (h[s.key] !== undefined) $(side + '-' + s.key).value = h[s.key];
   const ids = h.skillIds || [];
-  for (let i = 0; i < 3; i++)
-    $(side + '-skill' + i).value = (ids[i] && SKILLS[ids[i]]) ? ids[i] : '';
+  for (let i = 0; i < 3; i++) {
+    const id = (ids[i] && SKILLS[ids[i]]) ? ids[i] : '';
+    $(side + '-skill' + i).value = id;
+    const saved = id && h.skillDmgs && h.skillDmgs[id];
+    $(side + '-skilldmg' + i).value = (saved != null && isFinite(saved)) ? saved / 1e6 : '';
+    syncSkillDmgInput(side, i, true);
+  }
 }
 
 /* ---------- presets (localStorage) ---------- */
