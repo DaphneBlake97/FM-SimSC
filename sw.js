@@ -9,7 +9,7 @@
    Bump CACHE_VERSION on any release to invalidate old caches. */
 'use strict';
 
-const CACHE_VERSION = 'v7';
+const CACHE_VERSION = 'v8';
 const SHELL_CACHE = 'forge-pvp-shell-' + CACHE_VERSION;
 const RUNTIME_CACHE = 'forge-pvp-runtime-' + CACHE_VERSION;
 

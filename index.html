@@ -105,6 +105,19 @@
     margin-top: 6px;
   }
 
+  /* one aligned row per skill slot: [skill picker | dmg figure | hp figure] */
+  .skillslot {
+    grid-column: 1 / -1;
+    display: grid;
+    grid-template-columns: 1.5fr 1fr 1fr;
+    gap: 8px 12px;
+    align-items: end;
+  }
+  @media (max-width: 720px) {
+    .skillslot { grid-template-columns: 1fr 1fr; }
+    .skillslot .ss-select { grid-column: 1 / -1; }
+  }
+
   input[type=number], input[type=text], select {
     width: 100%;
     padding: 8px;                 /* thumb-friendly */
@@ -325,7 +338,7 @@
 
 // Shown in the header so a stale cached copy is identifiable at a glance.
 // Bump together with CACHE_VERSION in sw.js on every deploy.
-const APP_BUILD = 'v7 — instant updates when online';
+const APP_BUILD = 'v8 — aligned skill rows';
 
 /* =====================================================================
    TUNABLE CONSTANTS — each is an assumption to correct against the game.
@@ -878,19 +891,21 @@ function buildPanel(side, title) {
       <input type="number" inputmode="decimal" id="${side}-${s.key}" value="${s.def}" min="${s.min}" step="${s.step || 'any'}">
     </div>`;
   }
-  html += `<div class="grouphead">Skill loadout (pick 3) — damage is THIS hero's own figure</div>`;
+  html += `<div class="grouphead">Skill loadout (pick 3) — figures are THIS hero's own</div>`;
   for (let i = 0; i < 3; i++) {
-    html += `<div class="field">
-      <label for="${side}-skill${i}">Slot ${i + 1}</label>
-      <select id="${side}-skill${i}">${skillOptionsHtml()}</select>
-    </div>
-    <div class="field" id="${side}-skilldmgwrap${i}" style="visibility:hidden">
-      <label for="${side}-skilldmg${i}" id="${side}-skilldmglabel${i}">Slot ${i + 1} dmg/hit (M)</label>
-      <input type="number" inputmode="decimal" id="${side}-skilldmg${i}" min="0" step="any">
-    </div>
-    <div class="field" id="${side}-skillhpwrap${i}" style="visibility:hidden">
-      <label for="${side}-skillhp${i}">Slot ${i + 1} +Max HP (M)</label>
-      <input type="number" inputmode="decimal" id="${side}-skillhp${i}" min="0" step="any">
+    html += `<div class="skillslot">
+      <div class="field ss-select">
+        <label for="${side}-skill${i}">Slot ${i + 1}</label>
+        <select id="${side}-skill${i}">${skillOptionsHtml()}</select>
+      </div>
+      <div class="field" id="${side}-skilldmgwrap${i}" style="visibility:hidden">
+        <label for="${side}-skilldmg${i}" id="${side}-skilldmglabel${i}">dmg/hit (M)</label>
+        <input type="number" inputmode="decimal" id="${side}-skilldmg${i}" min="0" step="any">
+      </div>
+      <div class="field" id="${side}-skillhpwrap${i}" style="visibility:hidden">
+        <label for="${side}-skillhp${i}">+Max HP (M)</label>
+        <input type="number" inputmode="decimal" id="${side}-skillhp${i}" min="0" step="any">
+      </div>
     </div>`;
   }
   p.innerHTML = html + '</div>';
@@ -967,12 +982,12 @@ function syncSkillDmgInput(side, i, keepValue) {
   const hWrap = $(side + '-skillhpwrap' + i), hInp = $(side + '-skillhp' + i);
   if (def && def.type === 'damage_enemy') {
     dWrap.style.visibility = 'visible';
-    dLbl.textContent = 'Slot ' + (i + 1) + ' dmg/hit (M)';
+    dLbl.textContent = 'dmg/hit (M)';
     if (!keepValue || dInp.value === '') dInp.value = def.dmgPerHit / 1e6;
     hWrap.style.visibility = 'hidden'; hInp.value = '';
   } else if (def && def.type === 'buff_self') {
     dWrap.style.visibility = 'visible';
-    dLbl.textContent = 'Slot ' + (i + 1) + ' +base Dmg (M)';
+    dLbl.textContent = '+base Dmg (M)';
     if (!keepValue || dInp.value === '') dInp.value = (def.baseDamageAdd || 0) / 1e6;
     hWrap.style.visibility = 'visible';
     if (!keepValue || hInp.value === '') hInp.value = (def.maxHpAdd || 0) / 1e6;
