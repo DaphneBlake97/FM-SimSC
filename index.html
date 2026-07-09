@@ -481,16 +481,21 @@ function derivedStats(h) {
     firstAttackAt: aps > 0 ? engage + 1 / aps : Infinity,
     skills: (h.skills || []).map(def => {
       const cd = skillCooldown(h, def);
-      // per-hero damage override, falling back to the catalogue default
-      const perHit = (h.skillDmgs && h.skillDmgs[def.id] != null) ? h.skillDmgs[def.id] : (def.dmgPerHit || 0);
+      // per-hero overrides, falling back to the catalogue defaults
+      const perHit = (h.skillDmgs && h.skillDmgs[def.id] != null)
+        ? h.skillDmgs[def.id] : (def.dmgPerHit || def.baseDamageAdd || 0);
+      const hpAdd = (h.skillHps && h.skillHps[def.id] != null)
+        ? h.skillHps[def.id] : (def.maxHpAdd || 0);
       return {
         name: def.name, cd,
         firstCastAt: engage + (SKILLS_READY_AT_START ? 0 : cd),
         dmgTotal: def.type === 'damage_enemy'
           ? def.hits * perHit * (APPLY_SKILL_DMG_STAT ? 1 + h.skillDmgPct / 100 : 1)
           : 0,
-        healTotal: (def.type === 'buff_self' && def.maxHpAdd)
-          ? def.maxHpAdd * (APPLY_SKILL_HP_STAT ? 1 + h.skillHpPct / 100 : 1)
+        buffDmgAdd: def.type === 'buff_self' ? perHit : 0,
+        buffHpAdd:  def.type === 'buff_self' ? hpAdd : 0,
+        healTotal: (def.type === 'buff_self' && hpAdd)
+          ? hpAdd * (APPLY_SKILL_HP_STAT ? 1 + h.skillHpPct / 100 : 1)
           : 0,
       };
     }),
@@ -593,20 +598,21 @@ function castSkill(caster, target, sk) {
     }
   } else if (def.type === 'buff_self') {
     caster.buffs = caster.buffs.filter(b => b.src !== sk);   // refresh, don't stack
+    // sk.dmg / sk.hpAdd are the CASTER's own figures for this buff (per-player)
     caster.buffs.push({
       src: sk,
-      baseDamageAdd: def.baseDamageAdd || 0,
-      maxHpAdd: def.maxHpAdd || 0,
+      baseDamageAdd: sk.dmg || 0,
+      maxHpAdd: sk.hpAdd || 0,
       remaining: def.durationSec,
     });
     const hpB = caster.hp;
-    if (def.maxHpAdd) {
-      const healAmt = def.maxHpAdd * (APPLY_SKILL_HP_STAT ? 1 + caster.s.skillHpPct / 100 : 1);
+    if (sk.hpAdd) {
+      const healAmt = sk.hpAdd * (APPLY_SKILL_HP_STAT ? 1 + caster.s.skillHpPct / 100 : 1);
       caster.hp = Math.min(effMaxHp(caster), caster.hp + healAmt);
     }
     if (TRACE) tlog(tside(caster) + ' skill ' + def.name + ' buff applied (' +
-      (def.baseDamageAdd ? '+' + tfmt(def.baseDamageAdd) + ' base dmg, ' : '') +
-      (def.maxHpAdd ? '+' + tfmt(def.maxHpAdd) + ' maxHP, ' : '') + def.durationSec + 's)' +
+      (sk.dmg ? '+' + tfmt(sk.dmg) + ' base dmg, ' : '') +
+      (sk.hpAdd ? '+' + tfmt(sk.hpAdd) + ' maxHP, ' : '') + def.durationSec + 's)' +
       (caster.hp > hpB ? '; heal ' + tfmt(hpB) + ' → ' + tfmt(caster.hp) : '') +
       ' | maxHP now ' + tfmt(effMaxHp(caster)));
     if (def.cooldownFrom === 'activeEnd') sk.state = 'active';
@@ -634,10 +640,15 @@ function resolveFight(me, opp, traceArr) {
       // state 'cooldown': timer accumulates toward cd. state 'active': a buff
       // with cooldownFrom 'activeEnd' is running — timer paused until it ends.
       // Timer starts full when SKILLS_READY_AT_START, so the skill fires on tick 1.
-      // dmg: this HERO's damage for the skill (falls back to the catalogue value).
+      // dmg: this HERO's damage figure for the skill — dmgPerHit for damage
+      // skills, baseDamageAdd for buffs. hpAdd: this hero's Max-HP raise/heal
+      // for buffs. Both fall back to the catalogue values.
       return {
         def, cd, state: 'cooldown', timer: SKILLS_READY_AT_START ? cd : 0,
-        dmg: (h.skillDmgs && h.skillDmgs[def.id] != null) ? h.skillDmgs[def.id] : (def.dmgPerHit || 0),
+        dmg: (h.skillDmgs && h.skillDmgs[def.id] != null)
+          ? h.skillDmgs[def.id] : (def.dmgPerHit || def.baseDamageAdd || 0),
+        hpAdd: (h.skillHps && h.skillHps[def.id] != null)
+          ? h.skillHps[def.id] : (def.maxHpAdd || 0),
       };
     });
     f.hp = effMaxHp(f);
@@ -869,8 +880,12 @@ function buildPanel(side, title) {
       <select id="${side}-skill${i}">${skillOptionsHtml()}</select>
     </div>
     <div class="field" id="${side}-skilldmgwrap${i}" style="visibility:hidden">
-      <label for="${side}-skilldmg${i}">Slot ${i + 1} dmg/hit (M)</label>
+      <label for="${side}-skilldmg${i}" id="${side}-skilldmglabel${i}">Slot ${i + 1} dmg/hit (M)</label>
       <input type="number" inputmode="decimal" id="${side}-skilldmg${i}" min="0" step="any">
+    </div>
+    <div class="field" id="${side}-skillhpwrap${i}" style="visibility:hidden">
+      <label for="${side}-skillhp${i}">Slot ${i + 1} +Max HP (M)</label>
+      <input type="number" inputmode="decimal" id="${side}-skillhp${i}" min="0" step="any">
     </div>`;
   }
   p.innerHTML = html + '</div>';
@@ -920,29 +935,45 @@ function readHero(side) {
   h.baseAtkSpeed = BASE_ATTACK_SPEED;   // fixed by the game; only the % bonus varies
   h.skillIds = [0, 1, 2].map(i => $(side + '-skill' + i).value).filter(Boolean);
   h.skills = h.skillIds.map(id => SKILLS[id]).filter(Boolean);
-  // per-player skill damage: { skillId: absolute dmg per hit } from the slot inputs
+  // per-player skill figures from the slot inputs (all entered in millions):
+  //   skillDmgs { id: absolute } — dmg/hit for damage skills, +base Dmg for buffs
+  //   skillHps  { id: absolute } — +Max HP (and activation heal) for buffs
   h.skillDmgs = {};
+  h.skillHps = {};
   for (let i = 0; i < 3; i++) {
     const id = $(side + '-skill' + i).value;
     const def = id && SKILLS[id];
-    if (def && def.type === 'damage_enemy') {
-      const v = parseFloat($(side + '-skilldmg' + i).value);
-      if (isFinite(v) && v >= 0) h.skillDmgs[id] = v * 1e6;   // entered in millions
+    if (!def) continue;
+    const dv = parseFloat($(side + '-skilldmg' + i).value);
+    if (isFinite(dv) && dv >= 0) h.skillDmgs[id] = dv * 1e6;
+    if (def.type === 'buff_self') {
+      const hv = parseFloat($(side + '-skillhp' + i).value);
+      if (isFinite(hv) && hv >= 0) h.skillHps[id] = hv * 1e6;
     }
   }
   return h;
 }
-// keepValue: applyHero restores a saved value; a manual slot change resets to default
+// keepValue: applyHero restores saved values; a manual slot change resets to defaults
 function syncSkillDmgInput(side, i, keepValue) {
   const id = $(side + '-skill' + i).value;
   const def = id && SKILLS[id];
-  const wrap = $(side + '-skilldmgwrap' + i), inp = $(side + '-skilldmg' + i);
+  const dWrap = $(side + '-skilldmgwrap' + i), dInp = $(side + '-skilldmg' + i);
+  const dLbl = $(side + '-skilldmglabel' + i);
+  const hWrap = $(side + '-skillhpwrap' + i), hInp = $(side + '-skillhp' + i);
   if (def && def.type === 'damage_enemy') {
-    wrap.style.visibility = 'visible';
-    if (!keepValue || inp.value === '') inp.value = def.dmgPerHit / 1e6;
+    dWrap.style.visibility = 'visible';
+    dLbl.textContent = 'Slot ' + (i + 1) + ' dmg/hit (M)';
+    if (!keepValue || dInp.value === '') dInp.value = def.dmgPerHit / 1e6;
+    hWrap.style.visibility = 'hidden'; hInp.value = '';
+  } else if (def && def.type === 'buff_self') {
+    dWrap.style.visibility = 'visible';
+    dLbl.textContent = 'Slot ' + (i + 1) + ' +base Dmg (M)';
+    if (!keepValue || dInp.value === '') dInp.value = (def.baseDamageAdd || 0) / 1e6;
+    hWrap.style.visibility = 'visible';
+    if (!keepValue || hInp.value === '') hInp.value = (def.maxHpAdd || 0) / 1e6;
   } else {
-    wrap.style.visibility = 'hidden';
-    inp.value = '';
+    dWrap.style.visibility = 'hidden'; dInp.value = '';
+    hWrap.style.visibility = 'hidden'; hInp.value = '';
   }
 }
 function applyHero(side, h) {
@@ -953,8 +984,10 @@ function applyHero(side, h) {
   for (let i = 0; i < 3; i++) {
     const id = (ids[i] && SKILLS[ids[i]]) ? ids[i] : '';
     $(side + '-skill' + i).value = id;
-    const saved = id && h.skillDmgs && h.skillDmgs[id];
-    $(side + '-skilldmg' + i).value = (saved != null && isFinite(saved)) ? saved / 1e6 : '';
+    const savedD = id && h.skillDmgs && h.skillDmgs[id];
+    const savedH = id && h.skillHps && h.skillHps[id];
+    $(side + '-skilldmg' + i).value = (savedD != null && isFinite(savedD)) ? savedD / 1e6 : '';
+    $(side + '-skillhp' + i).value = (savedH != null && isFinite(savedH)) ? savedH / 1e6 : '';
     syncSkillDmgInput(side, i, true);
   }
 }
@@ -1665,7 +1698,10 @@ $('traceBtn').addEventListener('click', () => {
       (isFinite(D.firstAttackAt) ? D.firstAttackAt.toFixed(2) : '—'));
     for (const k of D.skills)
       L.push('  skill ' + k.name + ': ' +
-        (k.dmgTotal ? fmtC(k.dmgTotal) + ' dmg per cast' : 'buff' + (k.healTotal ? ' + heal ' + fmtC(k.healTotal) : '')) +
+        (k.dmgTotal
+          ? fmtC(k.dmgTotal) + ' dmg per cast'
+          : 'buff +' + fmtC(k.buffDmgAdd) + ' base dmg, +' + fmtC(k.buffHpAdd) + ' maxHP' +
+            (k.healTotal ? ', heal ' + fmtC(k.healTotal) : '')) +
         ', cd ' + k.cd.toFixed(2) + 's, first cast ≈ t=' + k.firstCastAt.toFixed(2));
     const hits = Math.ceil(F.effMaxHp / D.effDamage);
     L.push('  hits to kill (basic only, no crit/block): ' + hits +
