@@ -1,0 +1,1365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Forge PvP Sim</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="icon" type="image/png" href="icon-192.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Forge PvP">
+<meta name="theme-color" content="#1a1a19">
+<!--
+  index.html — Forge Master PvP simulator, installable offline PWA.
+  Ships with: manifest.webmanifest, sw.js, icon-180/192/512.png (upload all
+  from one folder to a static host). Vanilla JS except Tesseract.js, which is
+  lazy-loaded from a pinned CDN URL for screenshot autofill and cached by the
+  service worker so OCR works offline after the first online run.
+
+  Combat logic lives in four commented functions near the top of the script:
+    resolveFight(me, opp)  — the real-time fight loop
+    dealAttack(atk, def)   — one basic attack (crit / block / double strike / lifesteal)
+    castSkill(caster, target, sk) — one skill activation (damage_enemy / buff_self)
+    updateBuffs(f, dt)     — buff timers, expiry, HP re-clamp, activeEnd cooldown start
+  Tunable assumption-constants sit above them. The SKILLS catalogue holds the 6
+  confirmed skills; cooldowns and per-hit damage are editable in the UI (persisted locally).
+-->
+<style>
+  /* ---------- theme tokens (light default, dark via prefers-color-scheme) ---------- */
+  :root {
+    --page:      #f9f9f7;
+    --surface:   #fcfcfb;
+    --ink:       #0b0b0b;
+    --ink-2:     #52514e;
+    --muted:     #898781;
+    --grid:      #e1e0d9;
+    --baseline:  #c3c2b7;
+    --border:    rgba(11,11,11,.10);
+    --series:    #2a78d6;   /* histogram bars */
+    --series-hi: #104281;   /* hovered bar */
+    --accent:    #2a78d6;   /* buttons / focus */
+    --good:      #006300;   /* verdict: favoured */
+    --bad:       #d03b3b;   /* verdict: unfavoured */
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page:      #0d0d0d;
+      --surface:   #1a1a19;
+      --ink:       #ffffff;
+      --ink-2:     #c3c2b7;
+      --muted:     #898781;
+      --grid:      #2c2c2a;
+      --baseline:  #383835;
+      --border:    rgba(255,255,255,.10);
+      --series:    #3987e5;
+      --series-hi: #9ec5f4;
+      --accent:    #3987e5;
+      --good:      #0ca30c;
+      --bad:       #d03b3b;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--page);
+    color: var(--ink);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    /* safe-area padding for iPhone standalone mode (black-translucent status bar) */
+    padding: calc(16px + env(safe-area-inset-top, 0px))
+             calc(16px + env(safe-area-inset-right, 0px))
+             calc(16px + env(safe-area-inset-bottom, 0px))
+             calc(16px + env(safe-area-inset-left, 0px));
+  }
+  .wrap { max-width: 980px; margin: 0 auto; }
+
+  h1 { font-size: 20px; margin: 0 0 2px; }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  .sub { color: var(--ink-2); font-size: 13px; margin: 0 0 16px; }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+  }
+
+  /* ---------- hero panels ---------- */
+  .heroes { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 720px) { .heroes { grid-template-columns: 1fr; } }
+
+  .preset-row { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
+  .preset-row select { flex: 1 1 110px; min-width: 0; }
+  .preset-row input[type=text] { flex: 1 1 90px; min-width: 0; }
+
+  .fields { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; }
+  .field label { display: block; font-size: 11.5px; color: var(--muted); margin-bottom: 2px; }
+  .field.wide { grid-column: 1 / -1; }
+  .grouphead {
+    grid-column: 1 / -1;
+    font-size: 11px; font-weight: 600; letter-spacing: .04em;
+    color: var(--muted); text-transform: uppercase;
+    margin-top: 6px;
+  }
+
+  input[type=number], input[type=text], select {
+    width: 100%;
+    padding: 8px;                 /* thumb-friendly */
+    font: inherit; font-size: 16px;   /* >=16px stops iOS Safari zooming into focused inputs */
+    color: var(--ink);
+    background: var(--page);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+  }
+  input:focus-visible, select:focus-visible, button:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 1px;
+  }
+
+  /* segmented toggle (melee/ranged, histogram metric) */
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+  .seg button {
+    font: inherit; font-size: 13px;
+    padding: 6px 14px;
+    border: none; cursor: pointer;
+    background: transparent; color: var(--ink-2);
+  }
+  .seg button.on { background: var(--accent); color: #fff; font-weight: 600; }
+
+  button.small {
+    font: inherit; font-size: 13px;
+    padding: 6px 10px;
+    border: 1px solid var(--border); border-radius: 6px;
+    background: var(--surface); color: var(--ink);
+    cursor: pointer;
+  }
+  button.small:hover { border-color: var(--accent); }
+
+  /* ---------- skill catalogue editor ---------- */
+  .skills-card { margin-top: 14px; }
+  .skills-card .note { font-size: 12.5px; color: var(--ink-2); margin: 0 0 6px; }
+  .skrow {
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 0; border-top: 1px solid var(--grid);
+    flex-wrap: wrap;
+  }
+  .skrow:first-of-type { border-top: none; }
+  .skname { font-weight: 600; min-width: 96px; }
+  .sktier { font-size: 11px; color: var(--muted); display: block; font-weight: 400; }
+  .sksum { flex: 1 1 200px; font-size: 12.5px; color: var(--ink-2); }
+  .sksum input { width: 80px; padding: 5px 6px; margin: 0 4px; display: inline-block; }
+  .skcd  { display: flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--muted); }
+  .skcd input { width: 70px; }
+
+  /* ---------- controls ---------- */
+  .controls { display: flex; align-items: end; gap: 14px; margin: 14px 0; flex-wrap: wrap; }
+  .controls .field { width: 140px; }
+  .controls .field label { display: block; font-size: 11.5px; color: var(--muted); margin-bottom: 2px; }
+  #runBtn {
+    font: inherit; font-size: 15px; font-weight: 600;
+    padding: 10px 28px;
+    background: var(--accent); color: #fff;
+    border: none; border-radius: 8px; cursor: pointer;
+  }
+  #runBtn:disabled { opacity: .6; cursor: default; }
+
+  /* ---------- results ---------- */
+  .headline { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .winpct { font-size: 56px; font-weight: 600; line-height: 1; }
+  .winpct.det-win  { color: var(--good); }
+  .winpct.det-loss { color: var(--bad); }
+  @media (max-width: 720px) { .winpct { font-size: 44px; } }
+  .moe { font-size: 15px; color: var(--ink-2); }
+  .nline { font-size: 12.5px; color: var(--muted); }
+  .verdict { font-size: 17px; font-weight: 600; margin: 8px 0 2px; }
+  .verdict.v-good { color: var(--good); }
+  .verdict.v-bad  { color: var(--bad); }
+  .verdict.v-mid  { color: var(--ink-2); }
+  .timeout-note { font-size: 12.5px; color: var(--muted); }
+
+  .tiles {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 8px; margin-top: 14px;
+  }
+  .tile { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+  .tile .tl { font-size: 11.5px; color: var(--muted); }
+  .tile .tv { font-size: 19px; font-weight: 600; }
+
+  /* ---------- histogram ---------- */
+  .hist-card { margin-top: 14px; }
+  .hist-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
+  .hist-title { font-size: 13.5px; color: var(--ink-2); }
+  .hist-wrap { position: relative; }
+  #hist { width: 100%; height: 240px; display: block; touch-action: pan-y; }
+  #histTip {
+    position: absolute; pointer-events: none; display: none;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+    padding: 5px 8px; font-size: 12px; line-height: 1.35;
+    box-shadow: 0 2px 8px rgba(0,0,0,.18);
+    transform: translate(-50%, -100%);
+    white-space: nowrap;
+  }
+  #histTip .t1 { color: var(--ink); font-weight: 600; }
+  #histTip .t2 { color: var(--ink-2); }
+
+  /* ---------- OCR autofill ---------- */
+  .autofill-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .ocr-status { font-size: 12.5px; color: var(--ink-2); flex: 1 1 160px; }
+  .ocr-status.err { color: var(--bad); }
+  .spin {
+    display: inline-block; width: 13px; height: 13px;
+    border: 2px solid var(--muted); border-top-color: var(--accent);
+    border-radius: 50%; vertical-align: -2px; margin-right: 5px;
+    animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  input.autofilled {
+    box-shadow: 0 0 0 2px var(--accent);
+    animation: ocrflash 1.6s ease-out;
+  }
+  @keyframes ocrflash { 0% { background-color: rgba(42,120,214,.35); } }
+
+  /* ---------- narrow screens (~380px phones): full-width, 44px+ tap targets ---------- */
+  @media (max-width: 720px) {
+    .controls .field { width: 100%; }
+    #runBtn { width: 100%; min-height: 48px; }
+    button.small { min-height: 44px; }
+    .seg button { min-height: 44px; }
+    .autofill-row button.small { flex: 1 1 100%; }
+    .skcd { margin-left: auto; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Forge PvP Sim</h1>
+  <p class="sub">Monte-Carlo simulator for Forge Master arena fights — enter base values + % bonuses from the hero sheet, pick 3 skills, then Run.</p>
+
+  <div class="heroes">
+    <div class="card panel" id="panel-me"></div>
+    <div class="card panel" id="panel-opp"></div>
+  </div>
+
+  <div class="card skills-card">
+    <h2>Skill catalogue</h2>
+    <p class="note">Cooldowns and per-hit damage are editable — tune them here as you confirm them in-game
+    (saved on this device). Hit counts are fixed. Damage is entered in millions and is a BASE value; the
+    <code>APPLY_SKILL_*</code> constants in the file control whether the global Skill Dmg/Hp/Cooldown % stats scale it.</p>
+    <div id="skillRows"></div>
+  </div>
+
+  <div class="controls">
+    <div class="field">
+      <label for="simCount">Simulations (1–10000)</label>
+      <input type="number" inputmode="numeric" id="simCount" min="1" max="10000" step="1" value="100">
+    </div>
+    <button id="runBtn">Run</button>
+  </div>
+
+  <div class="card" id="results" hidden>
+    <div class="headline">
+      <span class="winpct" id="winPct">—</span>
+      <span class="moe" id="moe"></span>
+      <span class="nline" id="nline"></span>
+    </div>
+    <div class="verdict" id="verdict"></div>
+    <div class="timeout-note" id="timeoutNote"></div>
+    <div class="tiles" id="tiles"></div>
+
+    <div class="hist-card" id="histCard">
+      <div class="hist-head">
+        <span class="hist-title" id="histTitle"></span>
+        <span class="seg" id="metricSeg">
+          <button data-m="hp" class="on">My HP % left</button>
+          <button data-m="dur">Duration</button>
+        </span>
+      </div>
+      <div class="hist-wrap">
+        <canvas id="hist"></canvas>
+        <div id="histTip"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+/* =====================================================================
+   TUNABLE CONSTANTS — each is an assumption to correct against the game.
+   ===================================================================== */
+const DT = 0.05;         // simulation timestep in seconds
+const TIME_CAP = 120;    // max fight length (s); on timeout the higher HP% side wins, hitTimeCap set
+
+// How Damage% and Melee/Ranged Dmg% combine with base Damage:
+//  'additive'      : eff = Base × (1 + (Dmg% + Type%) / 100)
+//  'multiplicative': eff = Base × (1 + Dmg%/100) × (1 + Type%/100)
+const DMG_BONUS_MODE = 'additive';
+
+const BLOCK_REDUCTION = 0.5;        // a blocked hit does (1 - this) of its damage; 1.0 = full negate.
+                                    // Block is the ONLY mitigation (no defense/armour stat).
+const MELEE_APPROACH_DELAY = 3;     // seconds a melee hero waits before it can attack/cast; ranged = 0.
+                                    // While approaching it still regens and can be damaged freely.
+const BASE_INPUT_SCALE = 1000000;   // Base Damage and Base HP are ENTERED IN MILLIONS (2.5 -> 2,500,000).
+                                    // SKILLS catalogue numbers are already absolute and are NOT scaled.
+const SKILLS_CAN_CRIT = false;      // basic attacks crit; skills don't, unless true
+const SKILLS_READY_AT_START = true; // skills start off cooldown at t=0 (first cast on the first tick)
+const MULTI_HIT_SIMULTANEOUS = true;// multi-hit skills land all hits at once on cast
+                                    // (false is not implemented — hits would need a spread-out schedule;
+                                    //  tell me the real in-game spacing and I'll add it)
+
+// The catalogue's damage/heal numbers are BASE values that the hero's global
+// skill stats scale. If your in-game numbers already include those bonuses,
+// set these three to false:
+const APPLY_SKILL_DMG_STAT = true;  // skill damage  ×= (1 + SkillDmg%/100)
+const APPLY_SKILL_HP_STAT  = true;  // skill healing ×= (1 + SkillHp%/100)
+const APPLY_SKILL_CD_STAT  = true;  // skill cooldown ×= 1 / (1 + SkillCooldown%/100)
+
+const RANDOM_ACTION_ORDER = true;   // who acts first within a tick is re-rolled each tick, to avoid
+                                    // a systematic first-mover advantage. false = "me" always first.
+// ASSUMPTIONS without a switch (edit dealAttack / castSkill directly):
+//  - skills cannot be blocked and do not trigger lifesteal
+//  - re-casting a buff refreshes it (cannot stack with itself)
+//  - the buff's Max-HP raise is NOT scaled by Skill Hp % (only the activation heal is)
+//  - on a TIME_CAP tie in HP%, the fight counts as a LOSS (conservative)
+
+// Verdict thresholds on win probability:
+const VERDICT_FAVOURED = 0.60;      // p >= this  -> "Favoured"
+const VERDICT_UNFAVOURED = 0.40;    // p <= this  -> "Unfavoured"; between -> "Coin-flip"
+
+/* =====================================================================
+   SKILLS catalogue — 5 confirmed skills. Cooldowns are approximate and
+   editable in the UI (edits persist on this device and override these).
+   Effect types: "damage_enemy", "buff_self". The castSkill switch shows
+   where to add "heal_self" / "debuff_enemy" later.
+   cooldownFrom: "cast"      — cooldown timer starts at the moment of cast
+                 "activeEnd" — cooldown starts only when the buff expires
+                               (Inspired: 10s buff + 7s cd → ~17s full cycle)
+   ===================================================================== */
+const SKILLS = {
+  // --- Tier 4 (Yellow) ---
+  inspired: {
+    name: 'Inspired', tier: 4, type: 'buff_self',
+    baseDamageAdd: 200000,     // added to BASE Damage during the buff, so Dmg%/Melee%/Ranged% apply on top
+    maxHpAdd:      1600000,    // raises effMaxHP for the duration AND heals this amount on activation
+    durationSec:   10,
+    cooldownSec:   7,
+    cooldownFrom:  'activeEnd'
+  },
+  meteors:  { name: 'Meteors',  tier: 4, type: 'damage_enemy', hits: 4, dmgPerHit:  520000, cooldownSec: 6, cooldownFrom: 'cast' },
+  bomb:     { name: 'Bomb',     tier: 4, type: 'damage_enemy', hits: 1, dmgPerHit: 1570000, cooldownSec: 4, cooldownFrom: 'cast' },
+
+  // --- Tier 5 (Red) ---
+  worm:      { name: 'Worm',      tier: 5, type: 'damage_enemy', hits: 1, dmgPerHit: 8000000, cooldownSec: 7, cooldownFrom: 'cast' },
+  stampede:  { name: 'Stampede',  tier: 5, type: 'damage_enemy', hits: 2, dmgPerHit: 4000000, cooldownSec: 6, cooldownFrom: 'cast' },
+  lightning: { name: 'Lightning', tier: 5, type: 'damage_enemy', hits: 3, dmgPerHit: 1500000, cooldownSec: 4, cooldownFrom: 'cast' },
+
+  // Remaining skills (Tiers 1–3, Tier 6) go here in the same shape.
+};
+
+/* =====================================================================
+   DERIVED EFFECTIVE STATS — computed live because buffs can change base
+   Damage and Max HP mid-fight (Inspired).
+   f is a live fighter object: { s: heroInputs, buffs: [...], hp, ... }
+   ===================================================================== */
+// Base Damage including any active buff's baseDamageAdd (so % bonuses apply on top).
+// The input is in millions (× BASE_INPUT_SCALE); buff adds are absolute values.
+function curBaseDamage(f) {
+  let d = f.s.baseDamage * BASE_INPUT_SCALE;
+  for (const b of f.buffs) d += b.baseDamageAdd || 0;
+  return d;
+}
+// Effective per-hit damage from base Damage + Damage% + Melee/Ranged% (see DMG_BONUS_MODE).
+function effDamage(f) {
+  const typePct = f.s.isMelee ? f.s.meleePct : f.s.rangedPct;
+  const base = curBaseDamage(f);
+  return DMG_BONUS_MODE === 'additive'
+    ? base * (1 + (f.s.damagePct + typePct) / 100)
+    : base * (1 + f.s.damagePct / 100) * (1 + typePct / 100);
+}
+// Effective Max HP = BaseHP × (1 + MaxHP%/100), plus any active buff's flat maxHpAdd.
+// (Buff HP is added AFTER the % — the % does not multiply the buff. Assumption.)
+// The Base HP input is in millions (× BASE_INPUT_SCALE); buff adds are absolute values.
+function effMaxHp(f) {
+  let hp = f.s.baseHp * BASE_INPUT_SCALE * (1 + f.s.maxHpPct / 100);
+  for (const b of f.buffs) hp += b.maxHpAdd || 0;
+  return hp;
+}
+// Effective attacks/second; seconds between attacks = 1 / effAtkSpeed.
+function effAtkSpeed(f) {
+  return f.s.baseAtkSpeed * (1 + f.s.atkSpeedPct / 100);
+}
+// Effective cooldown for a skill def, given the hero's global Skill Cooldown %.
+function skillCooldown(h, def) {
+  return APPLY_SKILL_CD_STAT ? def.cooldownSec / (1 + h.skillCdPct / 100) : def.cooldownSec;
+}
+
+/* =====================================================================
+   COMBAT MODEL
+   ===================================================================== */
+
+// updateBuffs(f, dt): tick buff durations; when one expires, remove its
+// effect, re-clamp HP to the (now lower) effMaxHP, and — for skills with
+// cooldownFrom 'activeEnd' — start that skill's cooldown from zero.
+function updateBuffs(f, dt) {
+  if (!f.buffs.length) return;
+  let expired = false;
+  const keep = [];
+  for (const b of f.buffs) {
+    b.remaining -= dt;
+    if (b.remaining > 0) { keep.push(b); continue; }
+    expired = true;
+    if (b.src && b.src.def.cooldownFrom === 'activeEnd') {
+      b.src.state = 'cooldown';
+      b.src.timer = 0;
+    }
+  }
+  f.buffs = keep;
+  if (expired) f.hp = Math.min(f.hp, effMaxHp(f));  // buff HP is lost when the buff ends
+}
+
+// dealAttack(atk, def): one basic attack. Rolls double strike once, then
+// each hit rolls its own crit (attacker) and block (defender). Lifesteal
+// heals on damage actually dealt (post-block). Returns true if def died.
+// Tallies land on the fighter that owns them: attacker's crits/doubleStrikes/
+// dmgDealt, DEFENDER's blocks (blocks = "hits this fighter blocked").
+function dealAttack(atk, def) {
+  const dmg = effDamage(atk);
+  const doubled = Math.random() < atk.s.doubleStrike / 100;
+  if (doubled) atk.tally.doubleStrikes++;
+  const hits = doubled ? 2 : 1;
+  for (let i = 0; i < hits; i++) {
+    let d = dmg;
+    if (Math.random() < atk.s.critChance / 100) {
+      d *= 1 + atk.s.critDmg / 100;          // Crit Dmg is a +% bonus (50 = ×1.5 on crits)
+      atk.tally.crits++;
+    }
+    if (Math.random() < def.s.blockChance / 100) {
+      d *= 1 - BLOCK_REDUCTION;
+      def.tally.blocks++;
+    }
+    def.hp -= d;
+    if (atk.s.lifesteal > 0)
+      atk.hp = Math.min(effMaxHp(atk), atk.hp + d * atk.s.lifesteal / 100);
+    atk.tally.dmgDealt += d;
+    if (def.hp <= 0) return true;
+  }
+  return false;
+}
+
+// castSkill(caster, target, sk): one activation of equipped-skill instance sk.
+//  damage_enemy: `hits` hits of dmgPerHit (× SkillDmg% if APPLY_SKILL_DMG_STAT);
+//                skills cannot be blocked (assumption); crit only if SKILLS_CAN_CRIT.
+//                MULTI_HIT_SIMULTANEOUS: all hits land this tick.
+//  buff_self:    push the buff (refreshing any previous copy of itself), heal
+//                maxHpAdd (× SkillHp% if APPLY_SKILL_HP_STAT) on activation;
+//                cooldownFrom 'activeEnd' parks the skill until the buff expires.
+//  To add types later: 'heal_self' -> heal a flat amount here;
+//                      'debuff_enemy' -> push a buff object onto `target` with
+//                      negative adds (updateBuffs already handles expiry).
+// Returns true if target died.
+function castSkill(caster, target, sk) {
+  caster.tally.skillCasts++;
+  const def = sk.def;
+  if (def.type === 'damage_enemy') {
+    const per = def.dmgPerHit * (APPLY_SKILL_DMG_STAT ? 1 + caster.s.skillDmgPct / 100 : 1);
+    for (let i = 0; i < def.hits; i++) {
+      let d = per;
+      if (SKILLS_CAN_CRIT && Math.random() < caster.s.critChance / 100) {
+        d *= 1 + caster.s.critDmg / 100;     // same +% bonus convention as basic attacks
+        caster.tally.crits++;
+      }
+      target.hp -= d;                 // not blockable, no lifesteal (assumptions)
+      caster.tally.dmgDealt += d;
+      if (target.hp <= 0) return true;
+    }
+  } else if (def.type === 'buff_self') {
+    caster.buffs = caster.buffs.filter(b => b.src !== sk);   // refresh, don't stack
+    caster.buffs.push({
+      src: sk,
+      baseDamageAdd: def.baseDamageAdd || 0,
+      maxHpAdd: def.maxHpAdd || 0,
+      remaining: def.durationSec,
+    });
+    if (def.maxHpAdd) {
+      const healAmt = def.maxHpAdd * (APPLY_SKILL_HP_STAT ? 1 + caster.s.skillHpPct / 100 : 1);
+      caster.hp = Math.min(effMaxHp(caster), caster.hp + healAmt);
+    }
+    if (def.cooldownFrom === 'activeEnd') sk.state = 'active';
+  }
+  return target.hp <= 0;
+}
+
+// resolveFight(me, opp): run ONE full fight in real time and return the
+// outcome from MY perspective.
+// me / opp: hero input objects (see STAT_DEFS keys + isMelee + skills array
+// of SKILLS defs). Returns:
+// { win, durationSeconds, myHpLeft, oppHpLeft,   // HP left as % of effMaxHP at fight end
+//   dmgDealt, dmgTaken, crits, blocks, doubleStrikes, skillCasts,  // my counts
+//   hitTimeCap }                                  // true if the fight reached TIME_CAP
+function resolveFight(me, opp) {
+  // Build a live fighter: full HP, attack timer, one timer per equipped skill.
+  // engage: melee heroes must close the distance first — their attack AND skill
+  // timers are frozen until t >= engage (they still regen and can be hit).
+  function mkFighter(h) {
+    const f = { s: h, buffs: [], atkT: 0,
+      engage: h.isMelee ? MELEE_APPROACH_DELAY : 0,
+      tally: { dmgDealt: 0, crits: 0, blocks: 0, doubleStrikes: 0, skillCasts: 0 } };
+    f.skills = (h.skills || []).map(def => {
+      const cd = skillCooldown(h, def);
+      // state 'cooldown': timer accumulates toward cd. state 'active': a buff
+      // with cooldownFrom 'activeEnd' is running — timer paused until it ends.
+      // Timer starts full when SKILLS_READY_AT_START, so the skill fires on tick 1.
+      return { def, cd, state: 'cooldown', timer: SKILLS_READY_AT_START ? cd : 0 };
+    });
+    f.hp = effMaxHp(f);
+    return f;
+  }
+  const A = mkFighter(me), B = mkFighter(opp);   // A = me
+
+  let t = 0;
+  let winner = null; // 'me' | 'opp'
+  outer:
+  while (t < TIME_CAP - 1e-9) {
+    t += DT;
+
+    for (const f of [A, B]) {
+      // 1. Regen: % of CURRENT effMaxHP per second, continuous, capped.
+      if (f.s.regen > 0)
+        f.hp = Math.min(effMaxHp(f), f.hp + effMaxHp(f) * (f.s.regen / 100) * DT);
+      // 2. Buffs tick / expire (may re-clamp HP and release 'activeEnd' cooldowns).
+      updateBuffs(f, DT);
+    }
+
+    // Within-tick action order (see RANDOM_ACTION_ORDER).
+    const order = (RANDOM_ACTION_ORDER && Math.random() < 0.5) ? [B, A] : [A, B];
+
+    // 3. Attacks: fire each time the timer accumulates 1/effAtkSpeed seconds.
+    // The interval uses the CURRENT attack speed (extensible to atk-speed buffs).
+    // A melee hero's timer is frozen until it engages (starts counting at engage).
+    for (const f of order) {
+      if (t <= f.engage + 1e-9) continue;   // still approaching — cannot act
+      const as = effAtkSpeed(f);
+      if (as <= 0) continue;
+      const interval = 1 / as;
+      f.atkT += DT;
+      while (f.atkT + 1e-9 >= interval) {   // "while", in case DT > interval
+        f.atkT -= interval;
+        const foe = (f === A) ? B : A;
+        if (dealAttack(f, foe)) { winner = (foe === B) ? 'me' : 'opp'; break outer; }
+      }
+    }
+
+    // 4. Skills: each equipped skill has its own timer; 'active' buffs wait.
+    // Skill timers are frozen during a melee hero's approach, same as attacks.
+    for (const f of order) {
+      if (t <= f.engage + 1e-9) continue;   // still approaching — cannot act
+      const foe = (f === A) ? B : A;
+      for (const sk of f.skills) {
+        if (sk.state !== 'cooldown') continue;
+        sk.timer += DT;
+        if (sk.timer + 1e-9 >= sk.cd) {
+          sk.timer -= sk.cd;
+          if (castSkill(f, foe, sk)) { winner = (foe === B) ? 'me' : 'opp'; break outer; }
+        }
+      }
+    }
+  }
+
+  // Time cap: higher HP% (of current effMaxHP) wins; a dead-even tie counts
+  // as a loss (conservative).
+  const hitTimeCap = (winner === null);
+  if (hitTimeCap)
+    winner = (A.hp / effMaxHp(A)) > (B.hp / effMaxHp(B)) ? 'me' : 'opp';
+
+  return {
+    win: winner === 'me',
+    durationSeconds: Math.min(t, TIME_CAP),
+    myHpLeft:  Math.max(0, A.hp) / effMaxHp(A) * 100,
+    oppHpLeft: Math.max(0, B.hp) / effMaxHp(B) * 100,
+    dmgDealt: A.tally.dmgDealt,
+    dmgTaken: B.tally.dmgDealt,
+    crits: A.tally.crits,
+    blocks: A.tally.blocks,            // hits I blocked
+    doubleStrikes: A.tally.doubleStrikes,
+    skillCasts: A.tally.skillCasts,
+    hitTimeCap,
+  };
+}
+/* ============== end of combat model — everything below is UI ============== */
+
+
+/* ---------- stat schema (drives panel construction + presets) ---------- */
+// Field order matches the in-game stat screen so values can be entered top-to-bottom.
+const STAT_DEFS = [
+  { key: 'baseDamage',   label: 'Base Damage (in millions)',    def: 0.5, min: 0,  group: 'Base values' },
+  { key: 'baseHp',       label: 'Base HP (in millions)',        def: 10,  min: 0.000001 },
+  { key: 'baseAtkSpeed', label: 'Base Attack Speed (/s)',       def: 1.0, min: 0, step: 0.01 },
+  { key: 'critChance',   label: 'Crit Chance %',                def: 0,   min: 0,  group: 'Percentage bonuses' },
+  { key: 'critDmg',      label: 'Crit Dmg % — +% bonus (50 = 1.5× on crits)', def: 50, min: 0 },
+  { key: 'blockChance',  label: 'Block Chance %',               def: 0,   min: 0 },
+  { key: 'regen',        label: 'Health Regen % (per second)',  def: 0,   min: 0 },
+  { key: 'lifesteal',    label: 'Lifesteal %',                  def: 0,   min: 0 },
+  { key: 'doubleStrike', label: 'Double Strike Chance %',       def: 0,   min: 0 },
+  { key: 'damagePct',    label: 'Damage %',                     def: 0,   min: 0 },
+  { key: 'meleePct',     label: 'Melee Dmg %',                  def: 0,   min: 0 },
+  { key: 'rangedPct',    label: 'Ranged Dmg %',                 def: 0,   min: 0 },
+  { key: 'atkSpeedPct',  label: 'Attack Speed %',               def: 0,   min: 0 },
+  { key: 'skillDmgPct',  label: 'Skill Dmg %',                  def: 0,   min: 0 },
+  { key: 'skillCdPct',   label: 'Skill Cooldown %',             def: 0,   min: 0 },
+  { key: 'maxHpPct',     label: 'Max HP %',                     def: 0,   min: 0 },
+  { key: 'skillHpPct',   label: 'Skill Hp %',                   def: 0,   min: 0 },
+];
+
+// v4: Base Damage/HP switched to millions and Crit Dmg to a +% bonus — old
+// saved values would be misread, so the presets/last-state keys are versioned.
+const LS_PRESETS = 'forge-pvp-presets-v4';
+const LS_LAST    = 'forge-pvp-last-v4';
+const LS_CDS     = 'forge-pvp-skill-cds-v3';
+const LS_DMGS    = 'forge-pvp-skill-dmgs-v3';
+const $ = id => document.getElementById(id);
+
+const fmt1 = n => isFinite(n) ? (Math.round(n * 10) / 10).toLocaleString() : '—';
+function fmtC(n) {    // compact number (520000 -> 520K, 8000000 -> 8M)
+  if (!isFinite(n)) return '—';
+  const a = Math.abs(n);
+  let s;
+  if      (a >= 1e9) s = (n / 1e9).toFixed(a >= 1e10 ? 0 : 1) + 'B';
+  else if (a >= 1e6) s = (n / 1e6).toFixed(a >= 1e7 ? 0 : 2) + 'M';
+  else if (a >= 1e4) s = (n / 1e3).toFixed(a >= 1e5 ? 0 : 1) + 'K';
+  else return Math.round(n).toLocaleString();
+  return s.replace(/\.0+([KMB])$/, '$1').replace(/(\.\d)0([KMB])$/, '$1$2');
+}
+
+/* ---------- skill catalogue UI (editable cooldowns, persisted) ---------- */
+function skillSummary(def) {
+  if (def.type === 'buff_self')
+    return `+${fmtC(def.baseDamageAdd)} base Dmg, +${fmtC(def.maxHpAdd)} Max HP (heals that on cast), ${def.durationSec}s buff`;
+  return def.type;
+}
+// Persisted per-skill overrides: cooldowns (LS_CDS) and per-hit damage (LS_DMGS,
+// stored as the absolute value). Hit counts are fixed in the catalogue.
+function loadOverrides() {
+  try {
+    const cds = JSON.parse(localStorage.getItem(LS_CDS) || '{}');
+    for (const id in cds)
+      if (SKILLS[id] && isFinite(cds[id]) && cds[id] > 0) SKILLS[id].cooldownSec = cds[id];
+    const dmgs = JSON.parse(localStorage.getItem(LS_DMGS) || '{}');
+    for (const id in dmgs)
+      if (SKILLS[id] && SKILLS[id].type === 'damage_enemy' && isFinite(dmgs[id]) && dmgs[id] > 0)
+        SKILLS[id].dmgPerHit = dmgs[id];
+  } catch (e) {}
+}
+function saveOverride(key, id, v) {
+  try {
+    const o = JSON.parse(localStorage.getItem(key) || '{}');
+    o[id] = v;
+    localStorage.setItem(key, JSON.stringify(o));
+  } catch (e) {}
+}
+function buildSkillRows() {
+  const host = $('skillRows');
+  host.innerHTML = Object.entries(SKILLS).map(([id, s]) => {
+    // damage skills: editable per-hit damage (entered in MILLIONS, like Base Damage)
+    const effect = s.type === 'damage_enemy'
+      ? `<span class="sksum">${s.hits} hit${s.hits > 1 ? 's' : ''} ×
+           <input type="number" inputmode="decimal" min="0.01" step="0.01" value="${s.dmgPerHit / 1e6}" data-skill-dmg="${id}"> M per hit</span>`
+      : `<span class="sksum">${skillSummary(s)}${s.cooldownFrom === 'activeEnd' ? ' — cooldown starts when the buff ends' : ''}</span>`;
+    return `<div class="skrow">
+       <span class="skname">${s.name}<span class="sktier">Tier ${s.tier}${s.tier === 4 ? ' (Yellow)' : s.tier === 5 ? ' (Red)' : ''}</span></span>
+       ${effect}
+       <span class="skcd">cd (s) <input type="number" inputmode="decimal" min="0.1" step="0.1" value="${s.cooldownSec}" data-skill="${id}"></span>
+     </div>`;
+  }).join('');
+  host.addEventListener('input', e => {
+    const v = parseFloat(e.target.value);
+    if (!isFinite(v) || v <= 0) return;
+    const dmgId = e.target.dataset.skillDmg, cdId = e.target.dataset.skill;
+    if (dmgId)     { SKILLS[dmgId].dmgPerHit = v * 1e6; saveOverride(LS_DMGS, dmgId, v * 1e6); }
+    else if (cdId) { SKILLS[cdId].cooldownSec = v;      saveOverride(LS_CDS, cdId, v); }
+  });
+}
+
+/* ---------- build the two hero panels ---------- */
+function skillOptionsHtml() {
+  const tiers = [...new Set(Object.values(SKILLS).map(s => s.tier))].sort();
+  let html = '<option value="">— none —</option>';
+  for (const t of tiers) {
+    html += `<optgroup label="Tier ${t}${t === 4 ? ' (Yellow)' : t === 5 ? ' (Red)' : ''}">` +
+      Object.entries(SKILLS).filter(([, s]) => s.tier === t)
+        .map(([id, s]) => `<option value="${id}">${s.name}</option>`).join('') +
+      '</optgroup>';
+  }
+  return html;
+}
+
+function buildPanel(side, title) {
+  const p = $('panel-' + side);
+  let html = `<h2>${title}</h2>
+    <div class="preset-row">
+      <select id="${side}-preset"><option value="">— presets —</option></select>
+      <input type="text" id="${side}-pname" placeholder="preset name">
+      <button class="small" id="${side}-psave">Save</button>
+      <button class="small" id="${side}-pdel">Delete</button>
+    </div>
+    <div class="autofill-row">
+      <button class="small" id="${side}-ocrBtn">📷 Autofill from screenshot</button>
+      <input type="file" id="${side}-ocrFile" accept="image/*" hidden>
+      <span class="ocr-status" id="${side}-ocrStatus"></span>
+    </div>
+    <div class="fields">
+      <div class="field wide">
+        <label>Attack type</label>
+        <span class="seg" id="${side}-type">
+          <button data-t="melee" class="on">Melee</button>
+          <button data-t="ranged">Ranged</button>
+        </span>
+      </div>`;
+  for (const s of STAT_DEFS) {
+    if (s.group) html += `<div class="grouphead">${s.group}</div>`;
+    html += `<div class="field">
+      <label for="${side}-${s.key}">${s.label}</label>
+      <input type="number" inputmode="decimal" id="${side}-${s.key}" value="${s.def}" min="${s.min}" step="${s.step || 'any'}">
+    </div>`;
+  }
+  html += `<div class="grouphead">Skill loadout (pick 3)</div>`;
+  for (let i = 0; i < 3; i++) {
+    html += `<div class="field">
+      <label for="${side}-skill${i}">Slot ${i + 1}</label>
+      <select id="${side}-skill${i}">${skillOptionsHtml()}</select>
+    </div>`;
+  }
+  p.innerHTML = html + '</div>';
+
+  $(side + '-type').addEventListener('click', e => {
+    const b = e.target.closest('button'); if (!b) return;
+    setType(side, b.dataset.t);
+  });
+  $(side + '-psave').addEventListener('click', () => savePreset(side));
+  $(side + '-pdel').addEventListener('click', () => deletePreset(side));
+  // OCR autofill: button opens the photo picker (no `capture` attr — screenshots
+  // live in the gallery, never force the camera)
+  $(side + '-ocrBtn').addEventListener('click', () => $(side + '-ocrFile').click());
+  $(side + '-ocrFile').addEventListener('change', e => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';                       // allow re-picking the same file
+    if (file) runAutofill(side, file);
+  });
+  $(side + '-preset').addEventListener('change', () => {
+    const name = $(side + '-preset').value;
+    if (!name) return;
+    const all = getPresets();
+    if (all[name]) { applyHero(side, all[name]); $(side + '-pname').value = name; }
+  });
+}
+
+function setType(side, t) {
+  for (const b of $(side + '-type').querySelectorAll('button'))
+    b.classList.toggle('on', b.dataset.t === t);
+}
+function getType(side) {
+  return $(side + '-type').querySelector('button.on').dataset.t;
+}
+
+/* ---------- read / write hero stats from the form ---------- */
+function readHero(side) {
+  const h = { isMelee: getType(side) === 'melee' };
+  for (const s of STAT_DEFS) {
+    let v = parseFloat($(side + '-' + s.key).value);
+    if (!isFinite(v)) v = s.def;
+    h[s.key] = Math.max(s.min, v);
+  }
+  h.skillIds = [0, 1, 2].map(i => $(side + '-skill' + i).value).filter(Boolean);
+  h.skills = h.skillIds.map(id => SKILLS[id]).filter(Boolean);
+  return h;
+}
+function applyHero(side, h) {
+  setType(side, h.isMelee ? 'melee' : 'ranged');
+  for (const s of STAT_DEFS)
+    if (h[s.key] !== undefined) $(side + '-' + s.key).value = h[s.key];
+  const ids = h.skillIds || [];
+  for (let i = 0; i < 3; i++)
+    $(side + '-skill' + i).value = (ids[i] && SKILLS[ids[i]]) ? ids[i] : '';
+}
+
+/* ---------- presets (localStorage) ---------- */
+function getPresets() {
+  try { return JSON.parse(localStorage.getItem(LS_PRESETS) || '{}'); }
+  catch (e) { return {}; }
+}
+function putPresets(all) {
+  try { localStorage.setItem(LS_PRESETS, JSON.stringify(all)); } catch (e) {}
+}
+function refreshPresetLists() {
+  const names = Object.keys(getPresets()).sort();
+  for (const side of ['me', 'opp']) {
+    const sel = $(side + '-preset');
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">— presets —</option>' +
+      names.map(n => `<option>${n.replace(/</g, '&lt;')}</option>`).join('');
+    if (names.includes(cur)) sel.value = cur;
+  }
+}
+function stripHero(h) {   // what presets store (skillIds, not resolved skill objects)
+  const copy = Object.assign({}, h);
+  delete copy.skills;
+  return copy;
+}
+function savePreset(side) {
+  const inp = $(side + '-pname');
+  const name = inp.value.trim() || $(side + '-preset').value;
+  if (!name) {
+    inp.style.borderColor = 'var(--bad)';
+    setTimeout(() => { inp.style.borderColor = ''; }, 900);
+    return;
+  }
+  const all = getPresets();
+  all[name] = stripHero(readHero(side));
+  putPresets(all);
+  refreshPresetLists();
+  $(side + '-preset').value = name;
+  inp.value = name;
+}
+function deletePreset(side) {
+  const name = $(side + '-preset').value;
+  if (!name) return;
+  const all = getPresets();
+  delete all[name];
+  putPresets(all);
+  refreshPresetLists();
+  $(side + '-pname').value = '';
+}
+
+/* ---------- remember last-used inputs across sessions ---------- */
+function persistState() {
+  try {
+    localStorage.setItem(LS_LAST, JSON.stringify({
+      me: stripHero(readHero('me')), opp: stripHero(readHero('opp')), sims: $('simCount').value
+    }));
+  } catch (e) {}
+}
+function restoreState() {
+  try {
+    const st = JSON.parse(localStorage.getItem(LS_LAST) || 'null');
+    if (!st) return;
+    if (st.me)  applyHero('me',  st.me);
+    if (st.opp) applyHero('opp', st.opp);
+    if (st.sims) $('simCount').value = st.sims;
+  } catch (e) {}
+}
+
+/* ---------- run N simulations and aggregate ---------- */
+// Deterministic handling: if neither hero has crit/block/double-strike chance,
+// each run can only differ through the random within-tick action order (which
+// matters only on a simultaneous-kill tick). We run a small probe first; if
+// every probe result is identical the fight is deterministic and we show the
+// single outcome. Runs that differ fall through to the full Monte Carlo.
+function sameResult(a, b) {
+  return a.win === b.win && a.hitTimeCap === b.hitTimeCap &&
+    Math.abs(a.durationSeconds - b.durationSeconds) < 1e-9 &&
+    Math.abs(a.myHpLeft - b.myHpLeft) < 1e-6 &&
+    Math.abs(a.oppHpLeft - b.oppHpLeft) < 1e-6 &&
+    Math.abs(a.dmgDealt - b.dmgDealt) < 1e-3 &&
+    Math.abs(a.dmgTaken - b.dmgTaken) < 1e-3;
+}
+function runSims(n) {
+  const me = readHero('me'), opp = readHero('opp');
+  const noChance = h => h.critChance === 0 && h.blockChance === 0 && h.doubleStrike === 0;
+  const probeOnly = noChance(me) && noChance(opp);
+
+  const results = [];
+  const probeN = probeOnly ? Math.min(16, n) : n;
+  for (let i = 0; i < probeN; i++) results.push(resolveFight(me, opp));
+  const deterministic = results.every(r => sameResult(r, results[0]));
+  if (!deterministic && probeOnly)          // order-rng mattered: finish the full sample
+    for (let i = probeN; i < n; i++) results.push(resolveFight(me, opp));
+
+  const g = { n: deterministic ? 1 : results.length, deterministic,
+              wins: 0, losses: 0, timeouts: 0,
+              sumDur: 0, sumHpWin: 0, sumOppHpLoss: 0,
+              sumDealt: 0, sumTaken: 0, sumCrits: 0, sumBlocks: 0, sumDS: 0, sumCasts: 0,
+              hp: [], dur: [] };
+  const use = deterministic ? [results[0]] : results;
+  for (const r of use) {
+    if (r.win) { g.wins++; g.sumHpWin += r.myHpLeft; }
+    else       { g.losses++; g.sumOppHpLoss += r.oppHpLeft; }
+    if (r.hitTimeCap) g.timeouts++;
+    g.sumDur   += r.durationSeconds;
+    g.sumDealt += r.dmgDealt;      g.sumTaken += r.dmgTaken;
+    g.sumCrits += r.crits;         g.sumBlocks += r.blocks;
+    g.sumDS    += r.doubleStrikes; g.sumCasts += r.skillCasts;
+    g.hp.push(r.myHpLeft);
+    g.dur.push(r.durationSeconds);
+  }
+  return g;
+}
+
+/* ---------- results rendering ---------- */
+let lastRun = null;   // kept for histogram redraws (resize / theme / metric)
+let metric = 'hp';    // 'hp' | 'dur'
+
+function renderResults(g) {
+  lastRun = g;
+  $('results').hidden = false;
+  const wp = $('winPct'), v = $('verdict');
+
+  if (g.deterministic) {
+    const won = g.wins > 0;
+    wp.textContent = won ? 'WIN' : 'LOSS';
+    wp.className = 'winpct ' + (won ? 'det-win' : 'det-loss');
+    $('moe').textContent = '';
+    $('nline').textContent = 'deterministic — every run is identical, Monte Carlo adds nothing here';
+    v.textContent = won ? 'Favoured — you win this fight outright.' : 'Unfavoured — you lose this fight outright.';
+    v.className = 'verdict ' + (won ? 'v-good' : 'v-bad');
+    $('histCard').style.display = 'none';
+  } else {
+    const p = g.wins / g.n;
+    // 95% CI margin of error for a binomial proportion, in percentage points.
+    const moe = 1.96 * Math.sqrt(p * (1 - p) / g.n) * 100;
+    wp.textContent = (p * 100).toFixed(1) + '%';
+    wp.className = 'winpct';
+    $('moe').textContent = '± ' + moe.toFixed(1) + ' pp (95% CI)';
+    $('nline').textContent = g.wins + ' wins / ' + g.n + ' fights';
+    if (p >= VERDICT_FAVOURED)        { v.textContent = 'Favoured — take the fight.';       v.className = 'verdict v-good'; }
+    else if (p <= VERDICT_UNFAVOURED) { v.textContent = 'Unfavoured — skip this one.';      v.className = 'verdict v-bad'; }
+    else                              { v.textContent = 'Coin-flip — could go either way.'; v.className = 'verdict v-mid'; }
+    $('histCard').style.display = '';
+  }
+
+  $('timeoutNote').textContent = g.timeouts > 0
+    ? '⚠ ' + (g.deterministic ? 'The fight hits' : g.timeouts + ' of ' + g.n + ' fights hit') +
+      ' the ' + TIME_CAP + 's cap (winner decided by remaining HP%).'
+    : '';
+
+  const tiles = [
+    ['Avg fight duration',        fmt1(g.sumDur / g.n) + ' s'],
+    ['My HP % left (on wins)',    g.wins   ? fmt1(g.sumHpWin / g.wins) + '%' : '—'],
+    ['Opp HP % left (on losses)', g.losses ? fmt1(g.sumOppHpLoss / g.losses) + '%' : '—'],
+    ['Avg damage dealt',          fmtC(g.sumDealt / g.n)],
+    ['Avg damage taken',          fmtC(g.sumTaken / g.n)],
+    ['My crits / fight',          fmt1(g.sumCrits / g.n)],
+    ['My blocks / fight',         fmt1(g.sumBlocks / g.n)],
+    ['My double strikes / fight', fmt1(g.sumDS / g.n)],
+    ['My skill casts / fight',    fmt1(g.sumCasts / g.n)],
+    ['Fights at time cap',        g.deterministic ? (g.timeouts ? 'yes' : 'no')
+                                                  : g.timeouts + ' (' + (g.timeouts / g.n * 100).toFixed(0) + '%)'],
+  ];
+  $('tiles').innerHTML = tiles.map(([l, val]) =>
+    `<div class="tile"><div class="tl">${l}</div><div class="tv">${val}</div></div>`).join('');
+
+  if (!g.deterministic) drawHist();
+}
+
+/* ---------- histogram (canvas, single series, hover tooltip) ---------- */
+const canvas = $('hist'), ctx = canvas.getContext('2d');
+let bars = [];      // hit-test rects: {x, w, yTop, count, lo, hi}
+let hoverIdx = -1;
+
+function cssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+// Snap a raw step to 1/2/2.5/5 × 10^k.
+function niceStep(raw) {
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (raw <= m * mag + 1e-12) return m * mag;
+  return 10 * mag;
+}
+
+function binData() {
+  const data = metric === 'hp' ? lastRun.hp : lastRun.dur;
+  let lo, w, nBins;
+  if (metric === 'hp') {           // fixed 0–100%, 5-point bins
+    lo = 0; w = 5; nBins = 20;
+  } else {
+    let min = Math.min(...data), max = Math.max(...data);
+    if (max - min < 1e-9) { min = Math.max(0, min - 1); max = min + 2; }
+    w = niceStep((max - min) / 14);
+    lo = Math.floor(min / w) * w;
+    nBins = Math.max(1, Math.ceil((max - lo) / w + 1e-9));
+  }
+  const counts = new Array(nBins).fill(0);
+  for (const v of data) {
+    let i = Math.floor((v - lo) / w);
+    if (i < 0) i = 0; if (i >= nBins) i = nBins - 1;   // clamp edge values (e.g. HP = 100)
+    counts[i]++;
+  }
+  return { lo, w, counts };
+}
+
+function drawHist() {
+  if (!lastRun || lastRun.deterministic) return;
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+
+  $('histTitle').textContent = metric === 'hp'
+    ? 'My remaining HP % across all fights (losses land at 0)'
+    : 'Fight duration (seconds) across all fights';
+
+  const { lo, w, counts } = binData();
+  const nBins = counts.length;
+  const m = { t: 10, r: 8, b: 24, l: 38 };
+  const plotW = W - m.l - m.r, plotH = H - m.t - m.b;
+
+  // y scale: clean tick step covering the max count
+  const maxC = Math.max(1, ...counts);
+  const yStep = Math.max(1, Math.ceil(niceStep(maxC / 4)));
+  const yMax = Math.ceil(maxC / yStep) * yStep;
+
+  ctx.font = '11px system-ui, -apple-system, "Segoe UI", sans-serif';
+
+  // gridlines + y labels (hairline, recessive; counts)
+  ctx.strokeStyle = cssVar('--grid');
+  ctx.fillStyle = cssVar('--muted');
+  ctx.lineWidth = 1;
+  ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+  for (let yv = yStep; yv <= yMax; yv += yStep) {
+    const y = m.t + plotH * (1 - yv / yMax);
+    ctx.beginPath(); ctx.moveTo(m.l, y); ctx.lineTo(W - m.r, y); ctx.stroke();
+    ctx.fillText(String(yv), m.l - 6, y);
+  }
+  // baseline
+  ctx.strokeStyle = cssVar('--baseline');
+  ctx.beginPath(); ctx.moveTo(m.l, m.t + plotH + .5); ctx.lineTo(W - m.r, m.t + plotH + .5); ctx.stroke();
+
+  // bars: 2px surface gap, 4px rounded top, square baseline
+  const slot = plotW / nBins;
+  const barW = Math.max(1, slot - 2);
+  const cSeries = cssVar('--series'), cHi = cssVar('--series-hi');
+  bars = [];
+  for (let i = 0; i < nBins; i++) {
+    const h = counts[i] / yMax * plotH;
+    const x = m.l + i * slot + 1;
+    const yTop = m.t + plotH - h;
+    bars.push({ x, w: barW, yTop, count: counts[i], lo: lo + i * w, hi: lo + (i + 1) * w });
+    if (counts[i] === 0) continue;
+    const r = Math.min(4, barW / 2, h);
+    ctx.fillStyle = (i === hoverIdx) ? cHi : cSeries;
+    ctx.beginPath();
+    ctx.moveTo(x, yTop + h);
+    ctx.lineTo(x, yTop + r);
+    ctx.arcTo(x, yTop, x + r, yTop, r);
+    ctx.lineTo(x + barW - r, yTop);
+    ctx.arcTo(x + barW, yTop, x + barW, yTop + r, r);
+    ctx.lineTo(x + barW, yTop + h);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // x labels on bin edges, ~6 of them, muted
+  ctx.fillStyle = cssVar('--muted');
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  const every = Math.max(1, Math.ceil(nBins / 6));
+  for (let i = 0; i <= nBins; i += every) {
+    const x = m.l + i * slot;
+    const val = lo + i * w;
+    const txt = metric === 'hp' ? val + '%' : (Math.round(val * 10) / 10) + 's';
+    ctx.fillText(txt, Math.min(Math.max(x, m.l + 8), W - m.r - 12), m.t + plotH + 6);
+  }
+}
+
+/* hover / touch tooltip */
+function histPointer(e) {
+  if (!lastRun || lastRun.deterministic || !bars.length) return;
+  const rect = canvas.getBoundingClientRect();
+  const px = e.clientX - rect.left, py = e.clientY - rect.top;
+  let idx = -1;
+  for (let i = 0; i < bars.length; i++)
+    if (px >= bars[i].x - 1 && px <= bars[i].x + bars[i].w + 1) { idx = i; break; }
+  if (idx !== hoverIdx) { hoverIdx = idx; drawHist(); }
+  const tip = $('histTip');
+  if (idx < 0 || py > canvas.clientHeight) { tip.style.display = 'none'; return; }
+  const b = bars[idx];
+  const unit = metric === 'hp' ? '% HP left' : ' s';
+  const f = v => Math.round(v * 10) / 10;
+  tip.innerHTML = `<div class="t1">${f(b.lo)}–${f(b.hi)}${unit}</div>` +
+    `<div class="t2">${b.count} run${b.count === 1 ? '' : 's'} (${(b.count / lastRun.n * 100).toFixed(1)}%)</div>`;
+  tip.style.display = 'block';
+  const cx = Math.max(50, Math.min(canvas.clientWidth - 50, b.x + b.w / 2));
+  tip.style.left = cx + 'px';
+  tip.style.top = Math.max(30, b.yTop) + 'px';
+}
+function histLeave() {
+  hoverIdx = -1;
+  $('histTip').style.display = 'none';
+  if (lastRun && !lastRun.deterministic) drawHist();
+}
+canvas.addEventListener('pointermove', histPointer);
+canvas.addEventListener('pointerdown', histPointer);
+canvas.addEventListener('pointerleave', histLeave);
+
+$('metricSeg').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  metric = b.dataset.m;
+  for (const x of $('metricSeg').querySelectorAll('button'))
+    x.classList.toggle('on', x === b);
+  hoverIdx = -1; $('histTip').style.display = 'none';
+  drawHist();
+});
+
+window.addEventListener('resize', () => drawHist());
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => drawHist());
+
+/* ---------- run button ---------- */
+$('runBtn').addEventListener('click', () => {
+  let n = Math.round(parseFloat($('simCount').value));
+  if (!isFinite(n)) n = 100;
+  n = Math.max(1, Math.min(10000, n));
+  $('simCount').value = n;
+  persistState();
+  const btn = $('runBtn');
+  btn.disabled = true; btn.textContent = 'Running…';
+  setTimeout(() => {          // let the button repaint before the sim loop
+    renderResults(runSims(n));
+    btn.disabled = false; btn.textContent = 'Run';
+  }, 20);
+});
+
+/* =====================================================================
+   FEATURE A — OCR autofill from a stat-sheet screenshot.
+   Tesseract.js is the ONLY external library, lazy-loaded on first use from
+   pinned CDN URLs (the service worker caches these same URLs, so after one
+   online OCR run this works offline). OCR failing NEVER blocks manual entry.
+   ===================================================================== */
+const TESS = {   // pinned, versioned URLs — sw.js cache-firsts these hosts
+  script: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js',
+  worker: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js',
+  core:   'https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1',
+  lang:   'https://tessdata.projectnaptha.com/4.0.0',
+};
+let tessScriptPromise = null, tessWorkerPromise = null;
+
+function loadTesseractScript() {
+  if (window.Tesseract) return Promise.resolve();
+  if (!tessScriptPromise) {
+    tessScriptPromise = new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      const to = setTimeout(() => reject(new Error('tesseract load timeout')), 30000);
+      s.onload = () => { clearTimeout(to); resolve(); };
+      s.onerror = () => { clearTimeout(to); reject(new Error('tesseract load failed')); };
+      s.src = TESS.script;
+      document.head.appendChild(s);
+    }).catch(e => { tessScriptPromise = null; throw e; });   // allow retry later
+  }
+  return tessScriptPromise;
+}
+async function getTessWorker() {
+  await loadTesseractScript();
+  if (!tessWorkerPromise) {
+    tessWorkerPromise = Tesseract.createWorker('eng', 1, {
+      workerPath: TESS.worker, corePath: TESS.core, langPath: TESS.lang,
+    }).catch(e => { tessWorkerPromise = null; throw e; });
+  }
+  return tessWorkerPromise;
+}
+
+// Draw the picked image onto a canvas, downscaled so the longest side ≤ maxSide
+// (keeps OCR fast and memory-sane on mobile Safari).
+function fileToCanvas(file, maxSide) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+      const c = document.createElement('canvas');
+      c.width = Math.max(1, Math.round(img.width * scale));
+      c.height = Math.max(1, Math.round(img.height * scale));
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url);
+      resolve(c);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('unreadable image')); };
+    img.src = url;
+  });
+}
+
+/* ---- OCR text -> stat fields ---- */
+// Label matchers, checked in order (first hit wins) against the normalized
+// label text. kind 'pct' fills that % field directly. The dual-use labels use
+// the %-vs-raw disambiguation: a % value is a bonus, a large raw number is a
+// base value (converted to millions for Base Damage / Base HP).
+const OCR_MATCHERS = [
+  { keys: ['skill damage', 'skill dmg'],                      field: 'skillDmgPct',  kind: 'pct' },
+  { keys: ['skill cooldown', 'skill cd', 'cooldown'],         field: 'skillCdPct',   kind: 'pct' },
+  { keys: ['skill hp', 'skill health'],                       field: 'skillHpPct',   kind: 'pct' },
+  { keys: ['crit chance', 'crit rate', 'critical chance', 'critical rate'], field: 'critChance', kind: 'pct' },
+  { keys: ['crit dmg', 'crit damage', 'critical damage', 'critical dmg'],   field: 'critDmg',    kind: 'pct' },
+  { keys: ['block'],                                          field: 'blockChance',  kind: 'pct' },
+  { keys: ['regen'],                                          field: 'regen',        kind: 'pct' },
+  { keys: ['lifesteal', 'life steal'],                        field: 'lifesteal',    kind: 'pct' },
+  { keys: ['double'],                                         field: 'doubleStrike', kind: 'pct' },
+  { keys: ['melee'],                                          field: 'meleePct',     kind: 'pct' },
+  { keys: ['ranged'],                                         field: 'rangedPct',    kind: 'pct' },
+  { keys: ['attack speed', 'atk spd', 'atk speed'],           field: null,           kind: 'speed' },
+  { keys: ['damage bonus', 'dmg bonus'],                      field: 'damagePct',    kind: 'pct' },
+  { keys: ['max hp', 'hp', 'health'],                         field: null,           kind: 'hp' },
+  { keys: ['damage', 'dmg', 'atk'],                           field: null,           kind: 'dmg' },
+];
+const OCR_FIELD_LABELS = {
+  baseDamage: 'Base Damage', baseHp: 'Base HP', baseAtkSpeed: 'Attack Speed (base)',
+  critChance: 'Crit Chance', critDmg: 'Crit Dmg', blockChance: 'Block',
+  regen: 'Health Regen', lifesteal: 'Lifesteal', doubleStrike: 'Double Strike',
+  damagePct: 'Damage %', meleePct: 'Melee Dmg %', rangedPct: 'Ranged Dmg %',
+  atkSpeedPct: 'Attack Speed %', skillDmgPct: 'Skill Dmg %', skillCdPct: 'Skill Cooldown %',
+  maxHpPct: 'Max HP %', skillHpPct: 'Skill Hp %',
+};
+const OCR_NUM_RE = /[+]?\d[\d.,]*\s*[KkMmBb]?\s*%?/;
+
+const ocrNormLabel = s =>
+  s.toLowerCase().replace(/[^a-z%]+/g, ' ').replace(/\s+/g, ' ').trim();
+
+// "+2,500,000" / "2.5M" / "+83%" / "50 %" -> { value, isPct, hadSuffix }
+function parseOcrNumber(tok) {
+  const m = String(tok).trim().match(/^[+]?\s*([\d.,]+)\s*([KkMmBb])?\s*(%)?$/);
+  if (!m) return null;
+  let v = parseFloat(m[1].replace(/,/g, ''));
+  if (!isFinite(v)) return null;
+  const suf = (m[2] || '').toLowerCase();
+  if (suf === 'k') v *= 1e3;
+  else if (suf === 'm') v *= 1e6;
+  else if (suf === 'b') v *= 1e9;
+  return { value: v, isPct: !!m[3], hadSuffix: !!m[2] };
+}
+
+const round6 = v => Math.round(v * 1e6) / 1e6;
+
+// Resolve one (label, number) pair to a stat field + value, or null if it
+// doesn't pass the sanity rules. Only confident matches fill fields.
+function matchOcrField(label, num) {
+  for (const M of OCR_MATCHERS) {
+    if (!M.keys.some(k => label.includes(k))) continue;
+    if (M.kind === 'pct') {
+      if (num.hadSuffix) return null;               // "12K" is not a % bonus — misread
+      return { field: M.field, value: num.value };
+    }
+    if (M.kind === 'speed') {                       // "only if a raw base is shown"
+      if (num.isPct) return { field: 'atkSpeedPct', value: num.value };
+      return (num.value > 0 && num.value <= 20 && !num.hadSuffix)
+        ? { field: 'baseAtkSpeed', value: num.value } : null;
+    }
+    if (M.kind === 'hp') {
+      if (num.isPct) return { field: 'maxHpPct', value: num.value };
+      return num.value >= 1000                      // base HP must be a big absolute number
+        ? { field: 'baseHp', value: round6(num.value / 1e6) } : null;   // -> millions
+    }
+    if (M.kind === 'dmg') {
+      if (num.isPct) return { field: 'damagePct', value: num.value };
+      return num.value >= 1000                      // base Damage must be a big absolute number
+        ? { field: 'baseDamage', value: round6(num.value / 1e6) } : null;  // -> millions
+    }
+  }
+  return null;
+}
+
+// Scan OCR lines top-to-bottom. Each line pairs its label with the first
+// number to its right; a label-only line pairs with a number-only next line.
+// First value found for a field wins; later duplicates are ignored.
+function extractStats(lineTexts) {
+  const fills = {};
+  const lines = lineTexts.map(t => (t || '').trim()).filter(Boolean);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const m = line.match(OCR_NUM_RE);
+    let labelPart = null, numToken = null;
+    if (m && m.index > 0) {              // label and number on the same line
+      labelPart = line.slice(0, m.index);
+      numToken = m[0];
+    } else if (!m) {                     // label-only line: value may sit on the next line
+      labelPart = line;
+      const next = lines[i + 1] || '';
+      const nm = next.match(OCR_NUM_RE);
+      if (nm && ocrNormLabel(next.slice(0, nm.index)) === '') numToken = nm[0];
+    } else continue;                     // line starts with a number — no label
+    if (!labelPart || !numToken) continue;
+    const label = ocrNormLabel(labelPart);
+    if (!label) continue;
+    const num = parseOcrNumber(numToken);
+    if (!num) continue;
+    const hit = matchOcrField(label, num);
+    if (hit && fills[hit.field] === undefined) fills[hit.field] = hit.value;
+  }
+  return fills;
+}
+
+// Fill matched fields, tag them .autofilled (cleared when the user edits),
+// and report which OCR-fillable fields were NOT read. Never auto-runs.
+function applyOcrFills(side, fills) {
+  let filled = 0;
+  for (const [field, value] of Object.entries(fills)) {
+    const el = $(side + '-' + field);
+    if (!el) continue;
+    el.value = value;
+    el.classList.remove('autofilled');
+    void el.offsetWidth;                 // restart the flash animation
+    el.classList.add('autofilled');
+    filled++;
+  }
+  const missing = Object.keys(OCR_FIELD_LABELS)
+    .filter(f => fills[f] === undefined)
+    .map(f => OCR_FIELD_LABELS[f]);
+  return { filled, missing };
+}
+document.addEventListener('input', e => {
+  if (e.target.classList) e.target.classList.remove('autofilled');
+});
+
+async function runAutofill(side, file) {
+  const status = $(side + '-ocrStatus');
+  status.className = 'ocr-status';
+  status.innerHTML = '<span class="spin"></span>Reading screenshot…';
+  let canvas;
+  try {
+    canvas = await fileToCanvas(file, 1500);
+  } catch (e) {
+    status.textContent = 'Could not open that image — try another screenshot.';
+    status.className = 'ocr-status err';
+    return;
+  }
+  let worker;
+  try {
+    worker = await getTessWorker();
+  } catch (e) {   // offline before first cache, CDN blocked, etc. — degrade gracefully
+    status.textContent = 'Autofill needs internet the first time — enter stats manually for now';
+    status.className = 'ocr-status err';
+    return;
+  }
+  try {
+    const { data } = await worker.recognize(canvas);
+    const lineTexts = (data.lines && data.lines.length)
+      ? data.lines.map(l => l.text)
+      : String(data.text || '').split('\n');
+    const { filled, missing } = applyOcrFills(side, extractStats(lineTexts));
+    status.textContent = filled
+      ? `Autofilled ${filled} field${filled > 1 ? 's' : ''} — review before running.` +
+        (missing.length ? ` Couldn't read: ${missing.join(', ')}.` : '')
+      : 'Couldn’t read any stats from that image — enter them manually.';
+    if (!filled) status.className = 'ocr-status err';
+  } catch (e) {
+    status.textContent = 'OCR failed on that image — enter stats manually.';
+    status.className = 'ocr-status err';
+  }
+}
+
+/* ---------- PWA: register the service worker (needs http(s), not file://) ---------- */
+if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
+
+/* ---------- init ---------- */
+loadOverrides();
+buildSkillRows();
+buildPanel('me', 'My Hero');
+buildPanel('opp', 'Opponent');
+setType('opp', 'ranged');     // arbitrary default so the two panels differ
+refreshPresetLists();
+restoreState();
+</script>
+</body>
+</html>
