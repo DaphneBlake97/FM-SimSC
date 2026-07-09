@@ -1160,6 +1160,40 @@ async function getTessWorker() {
   return tessWorkerPromise;
 }
 
+// OCR image sizing: keep enough resolution that a phone screenshot's stat text
+// stays ≥ ~25px tall (1500 was too small for 1206×2622 iPhone shots).
+const OCR_MAX_SIDE = 2400;
+
+// Preprocess for this game's stylized UI: the stat text is always WHITE bold
+// on colored panels/art, so isolate "bright AND unsaturated" pixels and render
+// them black on white — panels, art, and colored badges all drop out, which
+// stops Tesseract's page segmentation latching onto the wrong region.
+// (An Otsu global threshold fails here: the huge black background dominates
+// the histogram and puts text in the same class as the panel.)
+// Returns a new canvas; the original is untouched (kept for a fallback pass).
+const OCR_TEXT_MIN_LUM = 190;   // white text is ~255; keep a margin for antialiasing
+const OCR_TEXT_MAX_SAT = 70;    // max(R,G,B)-min(R,G,B): white text is ~0, game art is high
+function preprocessForOcr(src) {
+  const c = document.createElement('canvas');
+  c.width = src.width; c.height = src.height;
+  const ctx2 = c.getContext('2d');
+  ctx2.drawImage(src, 0, 0);
+  const img = ctx2.getImageData(0, 0, c.width, c.height);
+  const d = img.data;
+  const n = c.width * c.height;
+  for (let i = 0; i < n; i++) {
+    const j = i * 4;
+    const r = d[j], g = d[j + 1], b = d[j + 2];
+    const lum = (r * 299 + g * 587 + b * 114) / 1000;
+    const sat = Math.max(r, g, b) - Math.min(r, g, b);
+    const isText = lum >= OCR_TEXT_MIN_LUM && sat <= OCR_TEXT_MAX_SAT;
+    const v = isText ? 0 : 255;
+    d[j] = d[j + 1] = d[j + 2] = v; d[j + 3] = 255;
+  }
+  ctx2.putImageData(img, 0, 0);
+  return c;
+}
+
 // Draw the picked image onto a canvas, downscaled so the longest side ≤ maxSide
 // (keeps OCR fast and memory-sane on mobile Safari).
 function fileToCanvas(file, maxSide) {
@@ -1182,10 +1216,14 @@ function fileToCanvas(file, maxSide) {
 
 /* ---- OCR text -> stat fields ---- */
 // Label matchers, checked in order (first hit wins) against the normalized
-// label text. kind 'pct' fills that % field directly. The dual-use labels use
-// the %-vs-raw disambiguation: a % value is a bonus, a large raw number is a
-// base value (converted to millions for Base Damage / Base HP).
+// label text. Wording calibrated to the real stat screen: values come FIRST
+// ("+24.3% Critical Chance"), and the base values appear top-right as
+// "3.47m Total Damage" / "22.6m Total Health". kind 'pct' fills that % field
+// directly; dual-use labels use the %-vs-raw disambiguation: a % value is a
+// bonus, a large raw number is a base value (converted to millions).
 const OCR_MATCHERS = [
+  { keys: ['total damage', 'total dmg'],                      field: null,           kind: 'dmg' },
+  { keys: ['total health', 'total hp'],                       field: null,           kind: 'hp' },
   { keys: ['skill damage', 'skill dmg'],                      field: 'skillDmgPct',  kind: 'pct' },
   { keys: ['skill cooldown', 'skill cd', 'cooldown'],         field: 'skillCdPct',   kind: 'pct' },
   { keys: ['skill hp', 'skill health'],                       field: 'skillHpPct',   kind: 'pct' },
@@ -1194,13 +1232,13 @@ const OCR_MATCHERS = [
   { keys: ['block'],                                          field: 'blockChance',  kind: 'pct' },
   { keys: ['regen'],                                          field: 'regen',        kind: 'pct' },
   { keys: ['lifesteal', 'life steal'],                        field: 'lifesteal',    kind: 'pct' },
-  { keys: ['double'],                                         field: 'doubleStrike', kind: 'pct' },
-  { keys: ['melee'],                                          field: 'meleePct',     kind: 'pct' },
-  { keys: ['ranged'],                                         field: 'rangedPct',    kind: 'pct' },
+  { keys: ['double'],                                         field: 'doubleStrike', kind: 'pct' },   // "Double Chance"
+  { keys: ['melee'],                                          field: 'meleePct',     kind: 'pct' },   // "Melee Damage"
+  { keys: ['ranged'],                                         field: 'rangedPct',    kind: 'pct' },   // "Ranged Damage"
   { keys: ['attack speed', 'atk spd', 'atk speed'],           field: null,           kind: 'speed' },
   { keys: ['damage bonus', 'dmg bonus'],                      field: 'damagePct',    kind: 'pct' },
   { keys: ['max hp', 'hp', 'health'],                         field: null,           kind: 'hp' },
-  { keys: ['damage', 'dmg', 'atk'],                           field: null,           kind: 'dmg' },
+  { keys: ['damage', 'dmg', 'atk'],                           field: null,           kind: 'dmg' },   // "+7.08% Damage"
 ];
 const OCR_FIELD_LABELS = {
   baseDamage: 'Base Damage', baseHp: 'Base HP', baseAtkSpeed: 'Attack Speed (base)',
@@ -1210,22 +1248,34 @@ const OCR_FIELD_LABELS = {
   atkSpeedPct: 'Attack Speed %', skillDmgPct: 'Skill Dmg %', skillCdPct: 'Skill Cooldown %',
   maxHpPct: 'Max HP %', skillHpPct: 'Skill Hp %',
 };
-const OCR_NUM_RE = /[+]?\d[\d.,]*\s*[KkMmBb]?\s*%?/;
+// Number token: optional +, digits with , . separators, optional K/M/B suffix
+// (only when NOT followed by another letter — "+168 Melee" must not read as
+// "168M"), optional %. Global flag: extractStats scans every token in a line.
+const OCR_NUM_RE = /[+]?\d[\d.,]*\s?(?:[KkMmBb](?![A-Za-z]))?\s*%?/g;
 
 const ocrNormLabel = s =>
   s.toLowerCase().replace(/[^a-z%]+/g, ' ').replace(/\s+/g, ' ').trim();
 
-// "+2,500,000" / "2.5M" / "+83%" / "50 %" -> { value, isPct, hadSuffix }
+// "+2,500,000" / "3.47m" / "+24.3%" / "50 %" -> { value, isPct, hadSuffix }
+// Tolerates OCR slips: trailing stray punctuation, and a comma that is really
+// a decimal point ("4,73%" -> 4.73, while "2,500,000" stays thousands).
 function parseOcrNumber(tok) {
-  const m = String(tok).trim().match(/^[+]?\s*([\d.,]+)\s*([KkMmBb])?\s*(%)?$/);
+  const m = String(tok).trim().match(/^[+]?\s*([\d.,]+?)[.,]?\s*([KkMmBb])?\s*(%)?$/);
   if (!m) return null;
-  let v = parseFloat(m[1].replace(/,/g, ''));
+  let digits = m[1];
+  if (digits.includes(',')) {
+    if (/^\d{1,3}(,\d{3})+$/.test(digits)) digits = digits.replace(/,/g, '');  // thousands groups
+    else if (/^\d+,\d{1,2}$/.test(digits)) digits = digits.replace(',', '.'); // decimal-comma slip
+    else digits = digits.replace(/,/g, '');
+  }
+  const v = parseFloat(digits);
   if (!isFinite(v)) return null;
   const suf = (m[2] || '').toLowerCase();
-  if (suf === 'k') v *= 1e3;
-  else if (suf === 'm') v *= 1e6;
-  else if (suf === 'b') v *= 1e9;
-  return { value: v, isPct: !!m[3], hadSuffix: !!m[2] };
+  return {
+    value: v * (suf === 'k' ? 1e3 : suf === 'm' ? 1e6 : suf === 'b' ? 1e9 : 1),
+    isPct: !!m[3],
+    hadSuffix: !!m[2],
+  };
 }
 
 const round6 = v => Math.round(v * 1e6) / 1e6;
@@ -1258,32 +1308,42 @@ function matchOcrField(label, num) {
   return null;
 }
 
-// Scan OCR lines top-to-bottom. Each line pairs its label with the first
-// number to its right; a label-only line pairs with a number-only next line.
-// First value found for a field wins; later duplicates are ignored.
+// Scan OCR lines top-to-bottom. Every number token on a line is considered;
+// each pairs first with the text to its LEFT (old "Damage 2,500,000" style),
+// then with the text to its RIGHT — the real stat screen is value-first
+// ("+24.3% Critical Chance", "3.47m Total Damage"). A label-only line still
+// pairs with a number-only next line. First value found for a field wins.
 function extractStats(lineTexts) {
   const fills = {};
-  const lines = lineTexts.map(t => (t || '').trim()).filter(Boolean);
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const m = line.match(OCR_NUM_RE);
-    let labelPart = null, numToken = null;
-    if (m && m.index > 0) {              // label and number on the same line
-      labelPart = line.slice(0, m.index);
-      numToken = m[0];
-    } else if (!m) {                     // label-only line: value may sit on the next line
-      labelPart = line;
-      const next = lines[i + 1] || '';
-      const nm = next.match(OCR_NUM_RE);
-      if (nm && ocrNormLabel(next.slice(0, nm.index)) === '') numToken = nm[0];
-    } else continue;                     // line starts with a number — no label
-    if (!labelPart || !numToken) continue;
-    const label = ocrNormLabel(labelPart);
-    if (!label) continue;
-    const num = parseOcrNumber(numToken);
-    if (!num) continue;
-    const hit = matchOcrField(label, num);
-    if (hit && fills[hit.field] === undefined) fills[hit.field] = hit.value;
+  let pendingLabel = null;   // label-only line waiting for a number-only line
+  for (const raw of lineTexts) {
+    let line = (raw || '').trim();
+    if (!line) { pendingLabel = null; continue; }
+    // OCR slip: a letter O adjacent to digits is a zero ("2O7" -> "207")
+    line = line.replace(/(?<=\d)[Oo]/g, '0').replace(/[Oo](?=\d)/g, '0');
+
+    const toks = [];
+    OCR_NUM_RE.lastIndex = 0;
+    let m;
+    while ((m = OCR_NUM_RE.exec(line)) !== null)
+      toks.push({ tok: m[0], start: m.index, end: m.index + m[0].length });
+
+    if (toks.length === 0) {             // label-only line
+      pendingLabel = ocrNormLabel(line) || null;
+      continue;
+    }
+    for (let i = 0; i < toks.length; i++) {
+      const num = parseOcrNumber(toks[i].tok);
+      if (!num) continue;
+      const before = ocrNormLabel(line.slice(i === 0 ? 0 : toks[i - 1].end, toks[i].start));
+      const after  = ocrNormLabel(line.slice(toks[i].end, i + 1 < toks.length ? toks[i + 1].start : line.length));
+      let hit = matchOcrField(before, num) || matchOcrField(after, num);
+      // number-only line right after a label-only line ("Ranged Dmg" / "+45%")
+      if (!hit && !before && !after && toks.length === 1 && pendingLabel)
+        hit = matchOcrField(pendingLabel, num);
+      if (hit && fills[hit.field] === undefined) fills[hit.field] = hit.value;
+    }
+    pendingLabel = null;
   }
   return fills;
 }
@@ -1316,7 +1376,7 @@ async function runAutofill(side, file) {
   status.innerHTML = '<span class="spin"></span>Reading screenshot…';
   let canvas;
   try {
-    canvas = await fileToCanvas(file, 1500);
+    canvas = await fileToCanvas(file, OCR_MAX_SIDE);
   } catch (e) {
     status.textContent = 'Could not open that image — try another screenshot.';
     status.className = 'ocr-status err';
@@ -1331,11 +1391,18 @@ async function runAutofill(side, file) {
     return;
   }
   try {
-    const { data } = await worker.recognize(canvas);
-    const lineTexts = (data.lines && data.lines.length)
-      ? data.lines.map(l => l.text)
-      : String(data.text || '').split('\n');
-    const { filled, missing } = applyOcrFills(side, extractStats(lineTexts));
+    // Pass 1: binarized (game-UI text on textured backgrounds reads far better);
+    // Pass 2 fallback: the untouched image, in case binarization hurt this shot.
+    const readLines = async img => {
+      const { data } = await worker.recognize(img);
+      return (data.lines && data.lines.length)
+        ? data.lines.map(l => l.text)
+        : String(data.text || '').split('\n');
+    };
+    let fills = extractStats(await readLines(preprocessForOcr(canvas)));
+    if (Object.keys(fills).length === 0)
+      fills = extractStats(await readLines(canvas));
+    const { filled, missing } = applyOcrFills(side, fills);
     status.textContent = filled
       ? `Autofilled ${filled} field${filled > 1 ? 's' : ''} — review before running.` +
         (missing.length ? ` Couldn't read: ${missing.join(', ')}.` : '')
